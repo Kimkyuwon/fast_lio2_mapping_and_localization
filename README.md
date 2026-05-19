@@ -51,9 +51,9 @@ $$Q = (A^T A)^{-1}, \quad \text{DOP} = \sqrt{\text{tr}(Q)}$$
 
 **Scaling via Tukey Loss Function**
 
-$$s(\rho) = \begin{cases} c^2 \left(1 - \left(1 - \left(\frac{\rho}{c}\right)^2\right)^3\right) & \text{if } \rho < c \\ c^2 & \text{otherwise} \end{cases}$$
+$$s(\sigma) = \begin{cases} c^2\left(1 - \left[1 - \left(\frac{\sigma}{c}\right)^2\right]^3\right) & \text{if } \sigma \leq c \\ c^2 & \text{otherwise} \end{cases}$$
 
-The computed $s(\rho)$ is multiplied with the LiDAR measurement covariance to dynamically adjust the measurement weight:
+The computed $s(\sigma)$ is multiplied with the LiDAR measurement covariance to dynamically adjust the measurement weight:
 
 $$R = s(\rho) \cdot \text{diag}(\sigma_L^2)$$
 
