@@ -104,7 +104,8 @@ source ~/ws_livox/install/setup.bash
 Mapping mode integrates with the `pose_graph_optimization` package:
 
 ```bash
-# The pose_graph_optimization package must be included in the same workspace
+cd <ros2_ws>/src
+git clone https://github.com/Kimkyuwon/Pose_Graph_Optimization.git
 ```
 
 ### 5. Dependencies (Localization Mode)
