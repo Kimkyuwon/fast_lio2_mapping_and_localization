@@ -161,11 +161,6 @@ Change `config_file` according to your LiDAR:
 ros2 launch livox_ros_driver2 msg_MID360_launch.py
 ```
 
-**Saving the PCD map**:
-1. Set `pcd_save.pcd_save_en: true` in the config file
-2. Set the `map_file_path` to the desired output path (default: `Map/` folder)
-3. Trigger the `/map_save` service via RQT to save the map
-
 ### Localization Mode
 
 ```bash
