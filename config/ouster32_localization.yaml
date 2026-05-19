@@ -6,7 +6,7 @@
         filter_size_surf: 0.4
         filter_size_map: 0.2
         cube_side_length: 1000.0
-        map_file_path: "Map/mabuk.pcd"
+        map_file_path: "Map/map1.pcd"
 
         common:
             lid_topic: "/ouster/points"
