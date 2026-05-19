@@ -1,0 +1,51 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 4
+        max_iteration: 5
+        filter_size_surf: 0.4
+        filter_size_map: 0.4
+        cube_side_length: 1000.0
+        map_file_path: "Map/g1Map.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            odom_topic:  "/scout_base_controller/odom"
+            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+        preprocess:
+            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  4
+            horizontal_resolution: 1800
+            blind: 1.0
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+            extrinsic_g2o_T: [ 0.0, 0.0, 0.0 ]
+            extrinsic_g2o_R: [ 1., 0., 0.,
+                            0., -1., 0.,
+                            0., 0., -1.]
+            keyframe_threshold: 1.0
+            odom_mode: 1
+            dop_flag: true
+
+        publish:
+            path_en:  true
+            scan_publish_en:  true       # false: close all the point cloud output
+            dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+            effect_map_en: true
