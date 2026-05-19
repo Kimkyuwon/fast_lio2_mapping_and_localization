@@ -1,199 +1,367 @@
-> ROS2 Fork repo maintainer: [Ericsiii](https://github.com/Ericsii)
+# FAST_LIO2 Mapping and Localization
 
-## Related Works and Extended Application
+FAST-LIO2 기반의 LiDAR-Inertial SLAM 패키지로, **DOP(Dilution of Precision) 기반 스캔 매칭 신뢰도 평가 기법**을 통합하여 강인한 Odometry 및 포즈 그래프 최적화를 지원합니다. 매핑(Mapping)과 로컬라이제이션(Localization) 두 가지 운용 모드를 제공합니다.
 
-**SLAM:**
+> **Base**: [FAST_LIO_ROS2 (Ericsii)](https://github.com/Ericsii/FAST_LIO_ROS2)  
+> **Extended by**: Kyu-Won Kim (김규원)
 
-1. [ikd-Tree](https://github.com/hku-mars/ikd-Tree): A state-of-art dynamic KD-Tree for 3D kNN search.
-2. [R2LIVE](https://github.com/hku-mars/r2live): A high-precision LiDAR-inertial-Vision fusion work using FAST-LIO as LiDAR-inertial front-end.
-3. [LI_Init](https://github.com/hku-mars/LiDAR_IMU_Init): A robust, real-time LiDAR-IMU extrinsic initialization and synchronization package..
-4. [FAST-LIO-LOCALIZATION](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION): The integration of FAST-LIO with **Re-localization** function module.
+---
 
-**Control and Plan:**
+## 주요 특징
 
-1. [IKFOM](https://github.com/hku-mars/IKFoM): A Toolbox for fast and high-precision on-manifold Kalman filter.
-2. [UAV Avoiding Dynamic Obstacles](https://github.com/hku-mars/dyn_small_obs_avoidance): One of the implementation of FAST-LIO in robot's planning.
-3. [UGV Demo](https://www.youtube.com/watch?v=wikgrQbE6Cs): Model Predictive Control for Trajectory Tracking on Differentiable Manifolds.
-4. [Bubble Planner](https://arxiv.org/abs/2202.12177): Planning High-speed Smooth Quadrotor Trajectories using Receding Corridors.
+- **이중 운용 모드**: 매핑 모드(지도 생성)와 로컬라이제이션 모드(사전 지도 기반 위치 추정) 분리 지원
+- **DOP 기반 스캔 매칭 신뢰도 평가**: GNSS에서 활용하는 DOP 개념을 LiDAR 스캔 매칭에 적용하여 측정치 가중치를 동적으로 조정
+  - **스캔 DOP**: 입력 스캔의 기하학적 분포를 평가하여 Voxel 필터 크기를 동적 조정
+  - **매칭 DOP**: 매칭된 포인트의 기하학적 분포를 평가하여 EKF 측정치 공분산을 adaptive하게 설정
+- **포즈 그래프 최적화 연동**: 매핑 모드에서 `pose_graph_optimization` 노드와 자동 연동, DOP 기반 루프 클로저 신뢰도 필터링 지원
+- **Octomap 연동**: 로컬라이제이션 모드에서 `octomap_server` 노드와 연동하여 실시간 점유 격자 지도 생성
+- **다중 LiDAR 지원**: Livox(Avia, MID360, MID70), Velodyne, Ouster(32/64/128), Hesai32
+- **성능 통계 출력**: 종료 시 포인트 매칭, KD-Tree, EKF 갱신 등 처리 시간 자동 출력
 
-<!-- 10. [**FAST-LIVO**](https://github.com/hku-mars/FAST-LIVO): Fast and Tightly-coupled Sparse-Direct LiDAR-Inertial-Visual Odometry. -->
+---
 
-## FAST-LIO
-**FAST-LIO** (Fast LiDAR-Inertial Odometry) is a computationally efficient and robust LiDAR-inertial odometry package. It fuses LiDAR feature points with IMU data using a tightly-coupled iterated extended Kalman filter to allow robust navigation in fast-motion, noisy or cluttered environments where degeneration occurs. Our package address many key issues:
-1. Fast iterated Kalman filter for odometry optimization;
-2. Automaticaly initialized at most steady environments;
-3. Parallel KD-Tree Search to decrease the computation;
+## 알고리즘 개요
 
-## FAST-LIO 2.0 (2021-07-05 Update)
-<!-- ![image](doc/real_experiment2.gif) -->
-<!-- [![Watch the video](doc/real_exp_2.png)](https://youtu.be/2OvjGnxszf8) -->
-<div align="left">
-<img src="doc/real_experiment2.gif" width=49.6% />
-<img src="doc/ulhkwh_fastlio.gif" width = 49.6% >
-</div>
+### FAST-LIO2 핵심 파이프라인
 
-**Related video:**  [FAST-LIO2](https://youtu.be/2OvjGnxszf8),  [FAST-LIO1](https://youtu.be/iYCY6T79oNU)
+FAST-LIO2는 IMU 데이터와 LiDAR 포인트 클라우드를 강결합(tightly-coupled)한 반복적 오류 상태 칼만 필터(IESKF)를 기반으로 위치 및 자세를 추정합니다.
 
-**Pipeline:**
-<div align="center">
-<img src="doc/overview_fastlio2.svg" width=99% />
-</div>
+1. **IMU 전파(Forward Propagation)**: IMU 측정값을 이용하여 로봇 상태를 예측
+2. **LiDAR 모션 보정(Undistortion)**: IMU 적분 결과를 이용하여 스캔 왜곡을 보정
+3. **포인트 매칭**: ikd-Tree를 이용한 스캔-투-맵(scan-to-map) 포인트 매칭
+4. **IESKF 갱신**: 매칭 잔차를 관측치로 사용하여 상태 갱신 및 공분산 업데이트
 
-**New Features:**
-1. Incremental mapping using [ikd-Tree](https://github.com/hku-mars/ikd-Tree), achieve faster speed and over 100Hz LiDAR rate.
-2. Direct odometry (scan to map) on Raw LiDAR points (feature extraction can be disabled), achieving better accuracy.
-3. Since no requirements for feature extraction, FAST-LIO2 can support many types of LiDAR including spinning (Velodyne, Ouster) and solid-state (Livox Avia, Horizon, MID-70) LiDARs, and can be easily extended to support more LiDARs.
-4. Support external IMU.
-5. Support ARM-based platforms including Khadas VIM3, Nivida TX2, Raspberry Pi 4B(8G RAM).
+### DOP 기반 스캔 매칭 신뢰도 평가
 
-**Related papers**: 
+GNSS에서 위성과 수신기 간의 기하학적 배치를 수치화한 DOP 개념을 LiDAR 스캔 매칭에 응용합니다.
 
-[FAST-LIO2: Fast Direct LiDAR-inertial Odometry](doc/Fast_LIO_2.pdf)
+**DOP 계산 수식**
 
-[FAST-LIO: A Fast, Robust LiDAR-inertial Odometry Package by Tightly-Coupled Iterated Kalman Filter](https://arxiv.org/abs/2010.08196)
+각 매칭 포인트 \( i \)에 대해 센서 원점과의 거리:
 
-**Contributors**
+$$r_i = \sqrt{(x_i - x_s)^2 + (y_i - y_s)^2 + (z_i - z_s)^2}$$
 
-[Wei Xu 徐威](https://github.com/XW-HKU)，[Yixi Cai 蔡逸熙](https://github.com/Ecstasy-EC)，[Dongjiao He 贺东娇](https://github.com/Joanna-HE)，[Fangcheng Zhu 朱方程](https://github.com/zfc-zfc)，[Jiarong Lin 林家荣](https://github.com/ziv-lin)，[Zheng Liu 刘政](https://github.com/Zale-Liu), [Borong Yuan](https://github.com/borongyuan)
+단위 벡터 행렬:
 
-<!-- <div align="center">
-    <img src="doc/results/HKU_HW.png" width = 49% >
-    <img src="doc/results/HKU_MB_001.png" width = 49% >
-</div> -->
+$$A = \begin{bmatrix} \frac{x_1 - x_s}{r_1} & \frac{y_1 - y_s}{r_1} & \frac{z_1 - z_s}{r_1} \\ \vdots & \vdots & \vdots \\ \frac{x_n - x_s}{r_n} & \frac{y_n - y_s}{r_n} & \frac{z_n - z_s}{r_n} \end{bmatrix}$$
 
-## 1. Prerequisites
-### 1.1 **Ubuntu** and **ROS**
-**Ubuntu >= 20.04**
+공분산 행렬 및 DOP:
 
-The **default from apt** PCL and Eigen is enough for FAST-LIO to work normally.
+$$Q = (A^T A)^{-1}, \quad \text{DOP} = \sqrt{\text{tr}(Q)}$$
 
-ROS >= Foxy (Recommend to use ROS-Humble). [ROS Installation](https://docs.ros.org/en/humble/Installation.html)
+**Tukey Loss Function을 통한 스케일링**
 
-### 1.2. **PCL && Eigen**
-PCL    >= 1.8,   Follow [PCL Installation](https://pointclouds.org/downloads/#linux).
+$$s(\rho) = \begin{cases} c^2 \left(1 - \left(1 - \left(\frac{\rho}{c}\right)^2\right)^3\right) & \text{if } \rho < c \\ c^2 & \text{otherwise} \end{cases}$$
 
-Eigen  >= 3.3.4, Follow [Eigen Installation](http://eigen.tuxfamily.org/index.php?title=Main_Page).
+계산된 \( s(\rho) \)를 LiDAR 측정치 공분산에 곱하여 가중치를 동적으로 조정합니다:
 
-### <span id="1.3">1.3. **livox_ros_driver2**</span>
-Follow [livox_ros_driver2 Installation](https://github.com/Livox-SDK/livox_ros_driver2).
+$$R = s(\rho) \cdot \text{diag}(\sigma_L^2)$$
 
-You can also use the one I modified [livox_ros_driver2](https://github.com/Ericsii/livox_ros_driver2/tree/feature/use-standard-unit)
+**두 단계 DOP 활용**
 
-*Remarks:*
-- Since the FAST-LIO must support Livox serials LiDAR firstly, so the **livox_ros_driver** must be installed and **sourced** before run any FAST-LIO launch file.
-- How to source? The easiest way is add the line ``` source $Livox_ros_driver_dir$/devel/setup.bash ``` to the end of file ``` ~/.bashrc ```, where ``` $Livox_ros_driver_dir$ ``` is the directory of the livox ros driver workspace (should be the ``` ws_livox ``` directory if you completely followed the livox official document).
+| 단계 | 입력 | 활용 방법 |
+|------|------|-----------|
+| 스캔 DOP | 입력 전체 스캔 포인트 | Voxel 필터 크기 동적 조정 (스캔 품질 불량 시 필터 크기 감소) |
+| 매칭 DOP | IESKF 관측에 사용된 매칭 포인트 | EKF 측정치 공분산(`lidar_meas_cov`) 동적 설정 |
 
+---
 
-## 2. Build
-Clone the repository and colcon build:
+## 시스템 구성
 
-```bash
-    cd <ros2_ws>/src # cd into a ros2 workspace folder
-    git clone https://github.com/Ericsii/FAST_LIO_ROS2.git --recursive
-    cd ..
-    rosdep install --from-paths src --ignore-src -y
-    colcon build --symlink-install
-    . ./install/setup.bash # use setup.zsh if use zsh
+### 매핑 모드 (Mapping)
+
 ```
-- **Remember to source the livox_ros_driver before build (follow [1.3 livox_ros_driver](#1.3))**
-- If you want to use a custom build of PCL, add the following line to ~/.bashrc
-```export PCL_ROOT={CUSTOM_PCL_PATH}```
-## 3. Directly run
-Noted:
-
-A. Please make sure the IMU and LiDAR are **Synchronized**, that's important.
-
-B. The warning message "Failed to find match for field 'time'." means the timestamps of each LiDAR points are missed in the rosbag file. That is important for the forward propagation and backwark propagation.
-
-C. We recommend to set the **extrinsic_est_en** to false if the extrinsic is give. As for the extrinsic initiallization, please refer to our recent work: [**Robust Real-time LiDAR-inertial Initialization**](https://github.com/hku-mars/LiDAR_IMU_Init).
-
-### 3.1 Run use ros launch
-Connect to your PC to Livox LiDAR by following  [Livox-ros-driver2 installation](https://github.com/Livox-SDK/livox_ros_driver2), then
-```bash
-cd <ros2_ws>
-. install/setup.bash # use setup.zsh if use zsh
-ros2 launch fast_lio mapping.launch.py config_file:=avia.yaml
+[LiDAR] ──┐
+           ├──► [FAST-LIO2 Node (laserMapping)] ──► /Odometry
+[IMU]  ──┘                                     ──► /cloud_registered
+                                                ──► /keyframe (키프레임)
+                                                       │
+                                               [Pose Graph Optimization Node]
+                                                       │
+                                                ──► /path (최적화된 궤적)
+                                                ──► Map/*.pcd (지도 저장)
 ```
 
-Change `config_file` parameter to other yaml file under config directory as you need.
+### 로컬라이제이션 모드 (Localization)
 
-Launch livox ros driver. Use MID360 as an example.
+```
+[LiDAR] ──┐
+           ├──► [FAST-LIO2 Localization Node (laserLocalization)] ──► /Odometry
+[IMU]  ──┘    ↑                                                  ──► /cloud_registered_body
+    [Map/*.pcd]
+                                                                          │
+                                                                  [Octomap Server Node]
+                                                                          │
+                                                                   ──► /projected_map
+                                                                   ──► /octomap_full
+```
+
+---
+
+## 필수 사전 설치
+
+### 1. Ubuntu & ROS2
+
+- **Ubuntu >= 20.04** (권장: Ubuntu 22.04)
+- **ROS >= Foxy** (권장: ROS Humble)
+  - [ROS Humble 설치](https://docs.ros.org/en/humble/Installation.html)
+
+### 2. PCL & Eigen
 
 ```bash
+sudo apt install libpcl-dev libeigen3-dev
+```
+
+- PCL >= 1.8
+- Eigen >= 3.3.4
+
+### 3. livox_ros_driver2
+
+Livox 계열 LiDAR를 사용할 경우 필수 설치:
+
+```bash
+git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+cd livox_ros_driver2
+./build.sh humble
+```
+
+설치 후 `~/.bashrc`에 소스 추가:
+
+```bash
+source ~/ws_livox/install/setup.bash
+```
+
+### 4. 의존 패키지 (매핑 모드)
+
+매핑 모드는 `pose_graph_optimization` 패키지와 연동됩니다:
+
+```bash
+# 동일 워크스페이스에 pose_graph_optimization 패키지 포함 필요
+```
+
+### 5. 의존 패키지 (로컬라이제이션 모드)
+
+로컬라이제이션 모드는 `octomap_server` 패키지와 연동됩니다:
+
+```bash
+sudo apt install ros-humble-octomap-server
+```
+
+---
+
+## 빌드
+
+```bash
+cd <ros2_ws>/src
+git clone https://github.com/Kimkyuwon/fast_lio2_mapping_and_localization.git --recursive fast_lio
+cd ..
+rosdep install --from-paths src --ignore-src -y
+colcon build --symlink-install --packages-select fast_lio
+source install/setup.bash
+```
+
+> **주의**: Livox LiDAR 사용 시 빌드 전 `livox_ros_driver2` 소스가 적용되어 있어야 합니다.
+
+---
+
+## 실행 방법
+
+### 매핑 모드
+
+```bash
+ros2 launch fast_lio mapping.launch.py config_file:=mapping_config.yaml
+```
+
+LiDAR 종류에 따라 `config_file` 변경:
+
+| LiDAR | config 파일 |
+|-------|------------|
+| Hesai Pandar 32 | `mapping_config.yaml` |
+| Livox Avia | `avia.yaml` |
+| Livox MID360 | `mid360.yaml` |
+| Livox MID70 | `mid70.yaml` |
+| Velodyne | `velodyne.yaml` |
+| Ouster 32 | `ouster32.yaml` |
+| Ouster 64 | `ouster64.yaml` |
+| Ouster 128 | `ouster128.yaml` |
+
+**실제 LiDAR 사용 시 드라이버 별도 실행**:
+
+```bash
+# MID360 예시
 ros2 launch livox_ros_driver2 msg_MID360_launch.py
 ```
 
-- For livox serials, FAST-LIO only support the data collected by the ``` livox_lidar_msg.launch ``` since only its ``` livox_ros_driver2/CustomMsg ``` data structure produces the timestamp of each LiDAR point which is very important for the motion undistortion. ``` livox_lidar.launch ``` can not produce it right now.
-- If you want to change the frame rate, please modify the **publish_freq** parameter in the [livox_lidar_msg.launch](https://github.com/Livox-SDK/livox_ros_driver/blob/master/livox_ros_driver2/launch/livox_lidar_msg.launch) of [Livox-ros-driver](https://github.com/Livox-SDK/livox_ros_driver2) before make the livox_ros_driver pakage.
+**PCD 맵 저장**:
+1. `mapping_config.yaml`에서 `pcd_save.pcd_save_en: true` 설정
+2. `map_file_path` 경로 지정 (기본: `Map/` 폴더)
+3. RQT에서 `/map_save` 서비스 호출하여 저장 트리거
 
-### 3.2 For Livox serials with external IMU
+### 로컬라이제이션 모드
 
-mapping_avia.launch theratically supports mid-70, mid-40 or other livox serial LiDAR, but need to setup some parameters befor run:
-
-Edit ``` config/avia.yaml ``` to set the below parameters:
-
-1. LiDAR point cloud topic name: ``` lid_topic ```
-2. IMU topic name: ``` imu_topic ```
-3. Translational extrinsic: ``` extrinsic_T ```
-4. Rotational extrinsic: ``` extrinsic_R ``` (only support rotation matrix)
-- The extrinsic parameters in FAST-LIO is defined as the LiDAR's pose (position and rotation matrix) in IMU body frame (i.e. the IMU is the base frame). They can be found in the official manual.
-- FAST-LIO produces a very simple software time sync for livox LiDAR, set parameter ```time_sync_en``` to ture to turn on. But turn on **ONLY IF external time synchronization is really not possible**, since the software time sync cannot make sure accuracy.
-
-### 3.4 PCD file save
-
-1. Enable `pcd_save.pcd_save_en` in the config file and set the `map_file_path` to the path where the map will be saved.
-2. Launch the fastlio2 according to README.
-3. Open RQt and switch to `Plugins->Services->Service Caller`. Trigger the service `/map_save`, then the pcd map file will be generated
-
-```pcl_viewer scans.pcd``` can visualize the point clouds.
-
-*Tips for pcl_viewer:*
-- change what to visualize/color by pressing keyboard 1,2,3,4,5 when pcl_viewer is running. 
-```
-    1 is all random
-    2 is X values
-    3 is Y values
-    4 is Z values
-    5 is intensity
-```
-
-## 4. Rosbag Example
-### 4.1 Livox Avia Rosbag
-<div align="left">
-<img src="doc/results/HKU_LG_Indoor.png" width=47% />
-<img src="doc/results/HKU_MB_002.png" width = 51% >
-
-Files: Can be downloaded from [google drive](https://drive.google.com/drive/folders/1CGYEJ9-wWjr8INyan6q1BZz_5VtGB-fP?usp=sharing)**!!!This ros1 bag should be convert to ros2!!!**
-
-Run:
 ```bash
-ros2 launch fast_lio mapping.launch.py config_path:=<path_to_your_config_file>
-ros2 bag play <your_bag_dir>
-
+ros2 launch fast_lio localization.launch.py config_file:=localization_config.yaml
 ```
 
-### 4.2 Velodyne HDL-32E Rosbag
+> `localization_config.yaml`의 `map_file_path`를 사전에 생성한 `.pcd` 파일 경로로 설정해야 합니다.
 
-**NCLT Dataset**: Original bin file can be found [here](http://robots.engin.umich.edu/nclt/).
+---
 
-We produce [Rosbag Files](https://drive.google.com/drive/folders/1VBK5idI1oyW0GC_I_Hxh63aqam3nocNK?usp=sharing) and [a python script](https://drive.google.com/file/d/1leh7DxbHx29DyS1NJkvEfeNJoccxH7XM/view) to generate Rosbag files: ```python3 sensordata_to_rosbag_fastlio.py bin_file_dir bag_name.bag```**!!!This ros1 bag should be convert to ros2!!!** To convert ros1 bag to ros2 bag, please follow the documentation [Convert rosbag versions](https://ternaris.gitlab.io/rosbags/topics/convert.html)
-    
-Run:
+## 파라미터 설정
+
+### 공통 파라미터
+
+| 파라미터 | 설명 | 기본값 |
+|---------|------|--------|
+| `common.lid_topic` | LiDAR 포인트 클라우드 토픽 | `/hesai/pandar` |
+| `common.imu_topic` | IMU 토픽 | `/alphasense/imu` |
+| `common.time_sync_en` | 소프트웨어 시간 동기화 활성화 | `false` |
+| `feature_extract_enable` | 특징 추출 활성화 (false: raw point 사용) | `false` |
+| `point_filter_num` | 포인트 필터링 간격 | `4` |
+| `max_iteration` | IESKF 최대 반복 횟수 | `5` |
+| `filter_size_surf` | Voxel 다운샘플링 크기 (m) | `0.4` |
+
+### 전처리 파라미터
+
+| 파라미터 | 설명 | LiDAR 유형 코드 |
+|---------|------|----------------|
+| `preprocess.lidar_type` | LiDAR 종류 | 1: Livox Avia, 2: Velodyne, 3: Ouster, 4: Hesai |
+| `preprocess.scan_line` | 수직 채널 수 | LiDAR 사양에 맞게 설정 |
+| `preprocess.blind` | 최소 유효 거리 (m) | `0.5` |
+
+### 매핑 파라미터
+
+| 파라미터 | 설명 | 기본값 |
+|---------|------|--------|
+| `mapping.extrinsic_T` | LiDAR→IMU 변환 (위치, m) | `[0,0,0]` |
+| `mapping.extrinsic_R` | LiDAR→IMU 변환 (회전 행렬) | Identity |
+| `mapping.keyframe_threshold` | 키프레임 생성 거리 임계값 (m) | `1.0` |
+| `mapping.dop_flag` | DOP 기반 가중치 조정 활성화 | `true` |
+
+### 로컬라이제이션 파라미터
+
+| 파라미터 | 설명 | 기본값 |
+|---------|------|--------|
+| `map_file_path` | 사전 생성 지도 파일 경로 | `Map/map.pcd` |
+| `localization.odom_mode` | Odometry 입력 모드 (0: 없음, 1: 2D, 2: 3D) | `2` |
+| `localization.dop_flag` | DOP 기반 가중치 조정 활성화 | `true` |
+
+### 포즈 그래프 최적화 파라미터 (매핑 모드)
+
+| 파라미터 | 설명 | 기본값 |
+|---------|------|--------|
+| `posegraph.r_solid_thres` | 루프 클로저 신뢰도 임계값 | `0.95` |
+| `posegraph.loop_dist` | 루프 클로저 탐색 최대 거리 (m) | `80.0` |
+| `posegraph.dop_thres` | 루프 클로저 DOP 필터링 임계값 | `1.2` |
+
+---
+
+## 발행 토픽
+
+### 매핑 노드 (`/fastlio_mapping`)
+
+| 토픽 | 타입 | 설명 |
+|------|------|------|
+| `/cloud_registered` | `PointCloud2` | 월드 좌표계 변환 포인트 클라우드 |
+| `/cloud_registered_body` | `PointCloud2` | 바디 좌표계 포인트 클라우드 |
+| `/Odometry` | `Odometry` | 추정된 로봇 Odometry |
+| `/path` | `Path` | 추정 궤적 |
+| `/effect_cloud` | `PointCloud2` | IESKF에 사용된 유효 포인트 |
+
+### 로컬라이제이션 노드 (`/fastlio_localization`)
+
+| 토픽 | 타입 | 설명 |
+|------|------|------|
+| `/cloud_registered_body` | `PointCloud2` | 바디 좌표계 포인트 클라우드 |
+| `/Odometry` | `Odometry` | 추정된 로봇 위치 |
+| `/path` | `Path` | 추정 궤적 |
+
+---
+
+## 구독 토픽
+
+| 토픽 | 타입 | 설명 |
+|------|------|------|
+| `<lid_topic>` | `PointCloud2` 또는 `CustomMsg` | LiDAR 포인트 클라우드 |
+| `<imu_topic>` | `Imu` | IMU 데이터 |
+| `<odom_topic>` | `Odometry` | 외부 Odometry (로컬라이제이션 모드) |
+
+---
+
+## 성능 지표 (DOP 기법 적용 결과)
+
+DOP 기반 스캔 매칭 신뢰도 평가 기법의 성능은 다음 데이터셋에서 검증되었습니다.
+
+### Hilti SLAM Challenge 2022 (ATE, m)
+
+| 방법 | exp-06 RMSE | exp-14 RMSE | exp-16 RMSE | exp-18 RMSE |
+|------|------------|------------|------------|------------|
+| FAST-LIO2 | 0.039 | 0.058 | 발산 | 1.452 |
+| Faster-LIO | 0.070 | 0.090 | 발산 | 4.000 |
+| **제안 기법** | **0.045** | 0.077 | **0.636** | **0.156** |
+
+> exp-16, exp-18은 좁은 계단 구간 포함. 기존 방법은 궤적이 발산하는 반면, DOP 기법 적용 시 안정적인 추정 유지.
+
+### VBR SLAM Dataset (ATE, m)
+
+| 방법 | Colosseum RMSE | Diag RMSE |
+|------|---------------|----------|
+| Faster-LIO | 2.730 | 0.217 |
+| Faster-LIO + PGO | 0.386 | 0.179 |
+| **제안 기법 (DOP + PGO)** | **0.250** | **0.165** |
+
+---
+
+## 관련 논문
+
+```bibtex
+@article{xu2022fastlio2,
+  title     = {FAST-LIO2: Fast Direct LiDAR-Inertial Odometry},
+  author    = {Xu, Wei and Cai, Yixi and He, Dongjiao and Lin, Jiarong and Zhang, Fu},
+  journal   = {IEEE Transactions on Robotics},
+  volume    = {38},
+  number    = {4},
+  pages     = {2053--2073},
+  year      = {2022}
+}
 ```
-roslaunch fast_lio mapping_velodyne.launch
-rosbag play YOUR_DOWNLOADED.bag
+
+```bibtex
+@article{kim2025dop,
+  title   = {Scan Matching Confidence Evaluation for Robust LiDAR Odometry and Pose Graph Optimization},
+  author  = {Kim, Kyu-Won},
+  journal = {Journal of Institute of Control, Robotics and Systems},
+  volume  = {31},
+  number  = {11},
+  pages   = {1299--1306},
+  year    = {2025},
+  doi     = {10.5302/J.ICROS.2025.25.0088}
+}
 ```
 
-## 5.Implementation on UAV
-In order to validate the robustness and computational efficiency of FAST-LIO in actual mobile robots, we build a small-scale quadrotor which can carry a Livox Avia LiDAR with 70 degree FoV and a DJI Manifold 2-C onboard computer with a 1.8 GHz Intel i7-8550U CPU and 8 G RAM, as shown in below.
+---
 
-The main structure of this UAV is 3d printed (Aluminum or PLA), the .stl file will be open-sourced in the future.
+## 관련 프로젝트
 
-<div align="center">
-    <img src="doc/uav01.jpg" width=40.5% >
-    <img src="doc/uav_system.png" width=57% >
-</div>
+**SLAM:**
+- [ikd-Tree](https://github.com/hku-mars/ikd-Tree): 3D kNN 탐색을 위한 동적 KD-Tree
+- [FAST-LIO-LOCALIZATION](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION): FAST-LIO 기반 재로컬라이제이션
+- [LI_Init](https://github.com/hku-mars/LiDAR_IMU_Init): LiDAR-IMU 외부 파라미터 초기화
 
-## 6.Acknowledgments
+**제어 및 계획:**
+- [IKFoM](https://github.com/hku-mars/IKFoM): 매니폴드 위 칼만 필터 툴박스
 
-Thanks for LOAM(J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time), [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM) and [Loam_Livox](https://github.com/hku-mars/loam_livox).
+---
+
+## 감사의 말
+
+- [FAST-LIO2 (HKU-MARS)](https://github.com/hku-mars/FAST_LIO): 핵심 LiDAR-Inertial Odometry 알고리즘
+- [FAST_LIO_ROS2 (Ericsii)](https://github.com/Ericsii/FAST_LIO_ROS2): ROS2 포팅 기반 코드
+- [LOAM](https://github.com/laboshinl/loam_velodyne): LiDAR Odometry 원본 알고리즘 (Ji Zhang, Carnegie Mellon University)
+- [Livox_Mapping](https://github.com/Livox-SDK/livox_mapping), [LINS](https://github.com/ChaoqinRobotics/LINS---LiDAR-inertial-SLAM)
+
+---
+
+## 라이선스
+
+BSD License
