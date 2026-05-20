@@ -57,7 +57,7 @@ c^2 & \text{otherwise}
 
 The computed $s(\sigma)$ is multiplied with the LiDAR measurement covariance to dynamically adjust the measurement weight:
 
-$$R = s(\rho) \cdot \text{diag}(\sigma_L^2)$$
+$$R = s(\sigma) \cdot \text{diag}(\sigma_L^2)$$
 
 **Two-Stage DOP Usage**
 
