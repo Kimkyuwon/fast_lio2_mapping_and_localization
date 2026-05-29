@@ -8,48 +8,41 @@
         cube_side_length: 1000.0
 
         common:
-            lid_topic:  "/ouster/points"
-            imu_topic:  "/ouster/imu"
-            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
-                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
-        
+            lid_topic: "/ouster/points"
+            imu_topic: "/ouster/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
         preprocess:
-            lidar_type: 3                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+            lidar_type: 3
             scan_line: 64
             horizontal_resolution: 1024
-            timestamp_unit: 3                 # 0-second, 1-milisecond, 2-microsecond, 3-nanosecond.
+            timestamp_unit: 3
             blind: 2.0
-
         mapping:
-            acc_cov: 1.0 
+            acc_cov: 1.0
             gyr_cov: 0.01
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
-            det_range:     60.0
-            extrinsic_est_en:  true      # true: enable the online estimation of IMU-LiDAR extrinsic
-            extrinsic_T: [ 0.0, 0.0, 0.0 ]
+            det_range: 60.0
+            extrinsic_est_en: true
+            extrinsic_T: [0.0, 0.0, 0.0]
             extrinsic_R: [1.0, 0.0, 0.0,
                         0.0, 1.0, 0.0,
                         0.0, 0.0, 1.0]
-            extrinsic_g2o_T: [ 0.0, 0.0, 0.0 ]
-            extrinsic_g2o_R: [ 1., 0., 0.,
-                            0., 1., 0.,
-                            0., 0., 1.]
+            extrinsic_g2o_T: [0.0, 0.0, 0.0]
+            extrinsic_g2o_R: [1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0]
             keyframe_threshold: 1.0
             dop_flag: true
-
         publish:
-            path_en:  true
-            scan_publish_en:  true       # false: close all the point cloud output
-            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+            path_en: true
+            scan_publish_en: true
+            scan_bodyframe_pub_en: true
             effect_map_en: true
-
         pcd_save:
             pcd_save_en: true
-            interval: -1                 # how many LiDAR frames saved in each pcd file; 
-                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
-
+            interval: -1
         posegraph:
             r_solid_thres: 0.95
             loop_dist: 80.0
@@ -65,36 +58,29 @@
             num_candidates_from_tree: 20
             dop_thres: 1.3
             dynamic_thres: 0.005
-
-            # patchworkpp:
             sensor_height: 2.0
             mode: "czm"
-            verbose: false   # To check effect of uprightness/elevation/flatness
-            visualize: true  # Ground Likelihood Estimation is visualized
-
-            # Ground Plane Fitting parameters
-            num_iter: 3             # Number of iterations for ground plane estimation using PCA.
-            num_lpr: 20             # Maximum number of points to be selected as lowest points representative.
-            num_min_pts: 10         # Minimum number of points to be estimated as ground plane in each patch.
-            th_seeds: 0.3           # threshold for lowest point representatives using in initial seeds selection of ground points.
-            th_dist: 0.125          # threshold for thickenss of ground.
-            th_seeds_v: 0.25        # threshold for lowest point representatives using in initial seeds selection of vertical structural points.
-            th_dist_v: 0.1          # threshold for thickenss of vertical structure.
-            max_r: 80.0             # max_range of ground estimation area
-            min_r: 2.0              # min_range of ground estimation area
-            uprightness_thr: 0.707  # threshold of uprightness using in Ground Likelihood Estimation(GLE). Please refer paper for more information about GLE.
-
-            adaptive_seed_selection_margin: -1.2 # The points below the adaptive_seed_selection_margin * sensor_height are filtered
+            verbose: false
+            visualize: true
+            num_iter: 3
+            num_lpr: 20
+            num_min_pts: 10
+            th_seeds: 0.3
+            th_dist: 0.125
+            th_seeds_v: 0.25
+            th_dist_v: 0.1
+            max_r: 80.0
+            min_r: 2.0
+            uprightness_thr: 0.707
+            adaptive_seed_selection_margin: -1.2
             czm:
                 num_zones: 4
                 num_sectors_each_zone: [16, 32, 54, 32]
                 mum_rings_each_zone: [2, 4, 4, 4]
-                elevation_thresholds:  [0.0, 0.0, 0.0, 0.0] # threshold of elevation for each ring using in GLE. Those values are updated adaptively.
-                flatness_thresholds:  [0.0, 0.0, 0.0, 0.0]  # threshold of flatness for each ring using in GLE. Those values are updated adaptively.
-
-            enable_RNR : true
-            enable_RVPF : true
-            enable_TGR : true
-
-            RNR_ver_angle_thr : -15.0 # Noise points vertical angle threshold. Downward rays of LiDAR are more likely to generate severe noise points.
-            RNR_intensity_thr : 0.2   # Noise points intensity threshold. The reflected points have relatively small intensity than others.=
+                elevation_thresholds: [0.0, 0.0, 0.0, 0.0]
+                flatness_thresholds: [0.0, 0.0, 0.0, 0.0]
+            enable_RNR: true
+            enable_RVPF: true
+            enable_TGR: true
+            RNR_ver_angle_thr: -15.0
+            RNR_intensity_thr: 0.2

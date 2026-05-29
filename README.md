@@ -4,6 +4,8 @@ A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution 
 
 > **Base**: [FAST_LIO_ROS2 (Ericsii)](https://github.com/Ericsii/FAST_LIO_ROS2)  
 
+![pipeline](doc/pipeline.png)
+
 ---
 
 ## Key Features
