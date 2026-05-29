@@ -3,6 +3,7 @@
 A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution of Precision)-based scan matching confidence evaluation** method for robust odometry and pose graph optimization. Two operation modes are supported: **Mapping** and **Localization**.
 
 > **Base**: [FAST_LIO_ROS2 (Ericsii)](https://github.com/Ericsii/FAST_LIO_ROS2)  
+> **Extended by**: Kyu-Won Kim
 
 ![pipeline](doc/pipeline.png)
 ![mapping](doc/mapping.gif)
