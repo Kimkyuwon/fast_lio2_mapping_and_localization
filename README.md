@@ -70,6 +70,8 @@ $$R = s(\sigma) \cdot \text{diag}(\sigma_L^2)$$
 | Scan DOP | Full input scan point cloud | Dynamically adjusts voxel filter size (reduces filter size when scan quality is poor) |
 | Matching DOP | Matched points used in IESKF observation | Dynamically sets EKF measurement covariance (`lidar_meas_cov`) |
 
+![DOP](doc/dop.png)
+
 ---
 
 ## Prerequisites
