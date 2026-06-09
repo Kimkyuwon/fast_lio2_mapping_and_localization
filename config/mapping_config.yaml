@@ -1,0 +1,87 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 4
+        max_iteration: 5
+        filter_size_surf: 0.4
+        filter_size_map: 0.4
+        cube_side_length: 1000.0
+
+        common:
+            lid_topic: "/hesai/pandar"
+            imu_topic: "/alphasense/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+        preprocess:
+            lidar_type: 4
+            scan_line: 32
+            horizontal_resolution: 500
+            timestamp_unit: 0
+            blind: 0.5
+        mapping:
+            acc_cov: 1.0
+            gyr_cov: 0.01
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            det_range: 100.0
+            extrinsic_est_en: true
+            extrinsic_T: [-0.001, -0.00855, 0.055]
+            extrinsic_R: [0.0, -1.0, 0.0,
+                        -1.0, 0.0, 0.0,
+                        0.0, 0.0, -1.0]
+            extrinsic_g2o_T: [0.0, 0.0, 0.0]
+            extrinsic_g2o_R: [1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0]
+            keyframe_threshold: 1.0
+            dop_flag: true
+        publish:
+            path_en: true
+            scan_publish_en: true
+            dense_publish_en: true
+            scan_bodyframe_pub_en: false
+            effect_map_en: true
+        pcd_save:
+            pcd_save_en: true
+            interval: -1
+        posegraph:
+            r_solid_thres: 0.95
+            loop_dist: 80.0
+            fov_u: 22.5
+            fov_d: -22.5
+            num_angle: 120
+            num_range: 100
+            num_height: 32
+            min_distance: 2
+            max_distance: 100
+            voxel_size: 0.1
+            num_exclude_recent: 20
+            num_candidates_from_tree: 20
+            dop_thres: 1.2
+            dynamic_thres: 0.005
+            sensor_height: 2.0
+            mode: "czm"
+            verbose: false
+            visualize: true
+            num_iter: 3
+            num_lpr: 20
+            num_min_pts: 10
+            th_seeds: 0.3
+            th_dist: 0.125
+            th_seeds_v: 0.25
+            th_dist_v: 0.1
+            max_r: 80.0
+            min_r: 2.0
+            uprightness_thr: 0.707
+            adaptive_seed_selection_margin: -1.2
+            czm:
+                num_zones: 4
+                num_sectors_each_zone: [16, 32, 54, 32]
+                mum_rings_each_zone: [2, 4, 4, 4]
+                elevation_thresholds: [0.0, 0.0, 0.0, 0.0]
+                flatness_thresholds: [0.0, 0.0, 0.0, 0.0]
+            enable_RNR: true
+            enable_RVPF: true
+            enable_TGR: true
+            RNR_ver_angle_thr: -15.0
+            RNR_intensity_thr: 0.2

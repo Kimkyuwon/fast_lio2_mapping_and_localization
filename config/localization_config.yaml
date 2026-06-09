@@ -1,0 +1,81 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 4
+        max_iteration: 5
+        filter_size_surf: 0.4
+        filter_size_map: 0.2
+        cube_side_length: 1000.0
+        map_file_path: "Map/map.pcd"
+
+        common:
+            lid_topic: "/velodyne_points"
+            imu_topic: "/imu/data"
+            odom_topic: "/scout_base_controller/odom"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+        preprocess:
+            lidar_type: 2
+            scan_line: 16
+            horizontal_resolution: 1800
+            timestamp_unit: 2
+            blind: 0.5
+        localization:
+            acc_cov: 1.0
+            gyr_cov: 0.01
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 50.0
+            extrinsic_est_en: true
+            extrinsic_T: [0.0, 0.0, 0.0]
+            extrinsic_R: [1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0]
+            extrinsic_g2o_T: [0.0, 0.0, 0.0]
+            extrinsic_g2o_R: [1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0]
+            keyframe_threshold: 1.0
+            odom_mode: 0
+            dop_flag: true
+        octomap:
+            resolution: 0.2
+            frame_id: "odom"
+            base_frame_id: "base_link"
+            sensor_model_max_range: 10.0
+            point_cloud_min_z: -0.5
+            point_cloud_max_z: 0.5
+            occupancy_min_z: -0.5
+            occupancy_max_z: 1.5
+            sensor_model_hit: 0.6
+            sensor_model_miss: 0.4
+            filter_ground_plane: true
+            sensor_height: 2.0
+            num_iter: 3
+            num_lpr: 10
+            num_min_pts: 5
+            th_seeds: 0.3
+            th_dist: 0.125
+            th_seeds_v: 0.25
+            th_dist_v: 0.1
+            max_r: 30.0
+            min_r: 2.0
+            uprightness_thr: 0.4
+            adaptive_seed_selection_margin: -1.2
+            czm:
+                num_zones: 4
+                num_sectors_each_zone: [16, 32, 32, 32]
+                num_rings_each_zone: [2, 4, 4, 4]
+                elevation_thresholds: [0.0, 0.0, 0.0, 0.0]
+                flatness_thresholds: [0.0, 0.0, 0.0, 0.0]
+            enable_RNR: true
+            enable_RVPF: true
+            enable_TGR: true
+            RNR_ver_angle_thr: -15.0
+            RNR_intensity_thr: 0.2
+        publish:
+            path_en: true
+            scan_publish_en: true
+            dense_publish_en: true
+            effect_map_en: true
