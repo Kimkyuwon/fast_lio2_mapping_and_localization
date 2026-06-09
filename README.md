@@ -4,9 +4,18 @@ A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution 
 
 > **Base**: [FAST_LIO_ROS2 (Ericsii)](https://github.com/Ericsii/FAST_LIO_ROS2)  
 
-![pipeline](doc/pipeline.png)
-![mapping](doc/mapping.gif)
-![localization](doc/localization.gif)
+<div align="center">
+
+**LIO Pipe Line**  
+<img src="doc/pipeline.png" width="700"/>
+
+**Mapping**  
+<img src="doc/mapping.gif" width="700"/>
+
+**Localization**  
+<img src="doc/localization.gif" width="700"/>
+
+</div>
 
 ---
 
