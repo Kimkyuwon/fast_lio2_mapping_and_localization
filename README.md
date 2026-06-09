@@ -6,13 +6,13 @@ A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution 
 
 <div align="center">
 
-LIO Pipe Line  
+LiDAR SLAM Pipe Line  
 <img src="doc/pipeline.png" width="700"/>
 
-Mapping  
+Mapping
 <img src="doc/mapping.gif" width="700"/>
 
-Localization 
+Localization
 <img src="doc/localization.gif" width="700"/>
 
 </div>
