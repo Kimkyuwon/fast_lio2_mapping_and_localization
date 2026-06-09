@@ -243,13 +243,9 @@ The DOP-based scan matching confidence evaluation was validated on the following
 
 ## Related Projects
 
-**SLAM:**
-- [ikd-Tree](https://github.com/hku-mars/ikd-Tree): State-of-the-art dynamic KD-Tree for 3D kNN search
-- [FAST-LIO-LOCALIZATION](https://github.com/HViktorTsoi/FAST_LIO_LOCALIZATION): Re-localization integration for FAST-LIO
-- [LI_Init](https://github.com/hku-mars/LiDAR_IMU_Init): Robust real-time LiDAR-IMU extrinsic initialization
-
-**Control and Planning:**
-- [IKFoM](https://github.com/hku-mars/IKFoM): Toolbox for fast on-manifold Kalman filter
+- [Pose-Graph-Optimization](https://github.com/Kimkyuwon/Pose_Graph_Optimization): LiDAR-based pose graph optimization backend with loop closure detection and dynamic object removal
+- [Long-Term-Mapping](https://github.com/Kimkyuwon/long_term_mapping): Multi-session LiDAR SLAM for long-term map maintenance with structural change detection
+- [SLAM-WebGUI](https://github.com/Kimkyuwon/ROS-SLAM-WebUI): Web-based GUI integrating SLAM, localization, and real-time visualization into a single browser interface — fully compatible with this package for convenient browser-based control
 
 ---
 
