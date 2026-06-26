@@ -127,6 +127,10 @@ bool   analytics_pos_init_    = false;
 // Residual statistics (beyond mean, computed from res_last[])
 double analytics_res_std_ = 0.0, analytics_res_min_ = 0.0, analytics_res_max_ = 0.0;
 
+// Buffer sizes captured BEFORE sync_packages consumes them (true backlog)
+int64_t analytics_pre_lidar_buf_ = 0;
+int64_t analytics_pre_imu_buf_   = 0;
+
 // CPU usage tracking
 struct tms analytics_last_tms_ = {};
 double     analytics_last_wall_ = 0.0;
@@ -1170,6 +1174,9 @@ public:
 private:
     void timer_callback()
     {
+        analytics_pre_lidar_buf_ = (int64_t)lidar_buffer.size();
+        analytics_pre_imu_buf_   = (int64_t)imu_buffer.size();
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1420,11 +1427,8 @@ private:
         msg.map_valid_size = (int64_t)ikdtree.validnum();
         msg.new_idxs       = (int64_t)add_point_size;
         msg.map_delete_size = (int64_t)kdtree_delete_counter;
-        {
-            std::unique_lock<std::mutex> lk(mtx_buffer, std::try_to_lock);
-            msg.buffer_size     = lk.owns_lock() ? (int64_t)lidar_buffer.size() : -1;
-            msg.imu_buffer_size = lk.owns_lock() ? (int64_t)imu_buffer.size()   : -1;
-        }
+        msg.buffer_size          = analytics_pre_lidar_buf_;
+        msg.imu_buffer_size      = analytics_pre_imu_buf_;
         msg.scan_time = lidar_mean_scantime;
 
         // --- Feature matching ---
@@ -1432,13 +1436,16 @@ private:
         msg.num_reject  = (int64_t)(feats_down_size - effct_feat_num);
         msg.match_ratio = (feats_down_size > 0)
                           ? (double)effct_feat_num / feats_down_size : 0.0;
+        msg.filter_size_surf_ad  = filter_size_surf_ad;
+        msg.point_filter_num_ad  = (int64_t)point_filter_num_ad;
 
         // --- Residual statistics ---
         msg.res_mean = res_mean_last;
         msg.res_std  = analytics_res_std_;
 
         // --- IESEKF ---
-        msg.kf_iterations = (int64_t)analytics_kf_iter_cnt_;
+        msg.kf_iterations  = (int64_t)analytics_kf_iter_cnt_;
+        msg.lidar_meas_cov = lidar_meas_cov;
         {
             auto P = kf.get_P();
             // In esekfom state order: rot[0-2], pos[3-5]

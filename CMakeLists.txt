@@ -87,6 +87,7 @@ set(msg_files
   "msg/Pose6D.msg"
   "msg/Frame.msg"
   "msg/LioAnalytics.msg"
+  "msg/LocAnalytics.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

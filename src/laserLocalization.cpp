@@ -67,6 +67,10 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include "fast_lio/msg/loc_analytics.hpp"
+#include <sys/times.h>
+#include <sys/resource.h>
+#include <cfloat>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -93,6 +97,48 @@ int process_count = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
+
+/*** Analytics Variables ***/
+// Sensor frequency tracking (count per ~1s window)
+double  analytics_freq_t0_   = -1.0;
+int     analytics_imu_cnt_w_ = 0, analytics_lid_cnt_w_ = 0;
+int64_t analytics_imu_freq_  = 0, analytics_lid_freq_  = 0;
+
+// Per-frame timing (seconds)
+double analytics_imu_time_   = 0.0, analytics_state_time_ = 0.0;
+double analytics_map_time_   = 0.0, analytics_total_time_ = 0.0;
+
+// Cumulative timing stats
+int    analytics_frame_cnt_   = 0;
+double analytics_mean_imu_    = 0.0, analytics_mean_state_ = 0.0;
+double analytics_mean_map_    = 0.0, analytics_mean_total_ = 0.0;
+double analytics_max_imu_     = 0.0, analytics_max_state_  = 0.0;
+double analytics_max_map_     = 0.0, analytics_max_total_  = 0.0;
+
+// Trajectory & keyframe
+double analytics_start_time_ = -1.0;
+double analytics_traj_dist_  = 0.0;
+V3D    analytics_prev_pos_   = V3D::Zero();
+bool   analytics_pos_init_   = false;
+
+// Residual statistics
+double analytics_res_mean_ = 0.0, analytics_res_std_ = 0.0;
+
+// Buffer sizes captured BEFORE sync_packages consumes them (true backlog)
+int64_t analytics_pre_lidar_buf_ = 0;
+int64_t analytics_pre_imu_buf_   = 0;
+
+// CPU usage tracking
+struct tms analytics_last_tms_ = {};
+double     analytics_last_wall_ = 0.0;
+int        analytics_num_proc_  = 1;
+bool       analytics_cpu_init_  = false;
+
+// Localization-specific
+bool   analytics_map_updated_ = false;
+double analytics_dop_ratio_   = 0.0;
+double analytics_down_dop_    = 0.0;
+/****************************/
 
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
@@ -391,6 +437,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 {
     mtx_buffer.lock();
     scan_count ++;
+    analytics_lid_cnt_w_++;
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
@@ -420,6 +467,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
+    analytics_lid_cnt_w_++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
@@ -594,6 +642,7 @@ void tf_static_cbk(const tf2_msgs::msg::TFMessage::ConstSharedPtr msg)
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
     publish_count ++;
+    analytics_imu_cnt_w_++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
     
@@ -1080,6 +1129,47 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time_count++;
 }
 
+double ComputeRamUsageMB()
+{
+    long rss = 0;
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (!fp) return 0.0;
+    char line[128];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            sscanf(line + 6, "%ld", &rss);
+            break;
+        }
+    }
+    fclose(fp);
+    return rss / 1024.0;
+}
+
+double ComputeCpuPercent()
+{
+    struct tms cur_tms;
+    double wall = omp_get_wtime();
+    times(&cur_tms);
+    if (!analytics_cpu_init_) {
+        analytics_last_tms_  = cur_tms;
+        analytics_last_wall_ = wall;
+        analytics_cpu_init_  = true;
+        return 0.0;
+    }
+    double elapsed = wall - analytics_last_wall_;
+    if (elapsed <= 0.0) return 0.0;
+    double cpu_ticks =
+        (double)((cur_tms.tms_utime - analytics_last_tms_.tms_utime) +
+                 (cur_tms.tms_stime - analytics_last_tms_.tms_stime));
+    double percent = (cpu_ticks / sysconf(_SC_CLK_TCK)) / elapsed
+                     / analytics_num_proc_ * 100.0;
+    analytics_last_tms_  = cur_tms;
+    analytics_last_wall_ = wall;
+    return percent;
+}
+
+// ------------------------------------------------
+
 class LaserLocalizationNode : public rclcpp::Node
 {
 public:
@@ -1196,6 +1286,9 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_viz);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", qos_viz);
         pubKeyFrame = this->create_publisher<fast_lio::msg::Frame> ("/key_frame", qos_viz);
+        pub_analytics_ = this->create_publisher<fast_lio::msg::LocAnalytics>("/loc_analytics", qos_viz);
+        analytics_num_proc_ = (int)sysconf(_SC_NPROCESSORS_ONLN);
+        if (analytics_num_proc_ <= 0) analytics_num_proc_ = 1;
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -1213,6 +1306,9 @@ public:
 private:
     void timer_callback()
     {
+        analytics_pre_lidar_buf_ = (int64_t)lidar_buffer.size();
+        analytics_pre_imu_buf_   = (int64_t)imu_buffer.size();
+
         if(sync_packages(Measures))
         {
             if (flg_first_scan)
@@ -1227,8 +1323,10 @@ private:
             double match_start, solve_start;
 
             match_time = 0;
-            
+
+            double t_imu_start = omp_get_wtime();
             p_imu->Process(Measures, kf, feats_undistort);
+            analytics_imu_time_ = omp_get_wtime() - t_imu_start;
             state_point = kf.get_x();
             
             /*** Transform feats_undistort from LiDAR frame to body frame ***/
@@ -1319,7 +1417,8 @@ private:
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(lidar_meas_cov, solve_H_time);  // 0.01 is dummy odom_R
-            
+            analytics_state_time_ = omp_get_wtime() - t_update_start;
+
             // solve_H_time 누적
             total_solve_H_time += solve_H_time;
             solve_H_time_count++;
@@ -1341,9 +1440,14 @@ private:
             if (odom_mode == 0) publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
+            analytics_map_time_    = 0.0;
+            analytics_map_updated_ = false;
             if (initial_flag && dop_ratio > 1.4)
             {
+                double t_map_start = omp_get_wtime();
                 map_incremental();
+                analytics_map_time_    = omp_get_wtime() - t_map_start;
+                analytics_map_updated_ = true;
 
                 PointCloudXYZI::Ptr temp_worldMap(new PointCloudXYZI(*feats_undistort));
                 for (size_t k = 0; k < feats_undistort->points.size(); k++)
@@ -1377,9 +1481,162 @@ private:
             double current_process_time = omp_get_wtime() - process_start;
             total_process_time += current_process_time;
             process_count++;
+
+            // ------ Analytics: collect per-frame data ------
+            if (analytics_start_time_ < 0.0)
+                analytics_start_time_ = omp_get_wtime();
+
+            analytics_total_time_ = analytics_imu_time_ + analytics_state_time_ + analytics_map_time_;
+
+            // Cumulative timing (Welford online mean)
+            analytics_frame_cnt_++;
+            analytics_mean_imu_   += (analytics_imu_time_   - analytics_mean_imu_)   / analytics_frame_cnt_;
+            analytics_mean_state_ += (analytics_state_time_ - analytics_mean_state_) / analytics_frame_cnt_;
+            analytics_mean_map_   += (analytics_map_time_   - analytics_mean_map_)   / analytics_frame_cnt_;
+            analytics_mean_total_ += (analytics_total_time_ - analytics_mean_total_) / analytics_frame_cnt_;
+            if (analytics_imu_time_   > analytics_max_imu_)   analytics_max_imu_   = analytics_imu_time_;
+            if (analytics_state_time_ > analytics_max_state_) analytics_max_state_ = analytics_state_time_;
+            if (analytics_map_time_   > analytics_max_map_)   analytics_max_map_   = analytics_map_time_;
+            if (analytics_total_time_ > analytics_max_total_) analytics_max_total_ = analytics_total_time_;
+
+            // Trajectory distance
+            if (!analytics_pos_init_) {
+                analytics_prev_pos_ = state_point.pos;
+                analytics_pos_init_ = true;
+            } else {
+                analytics_traj_dist_ += (state_point.pos - analytics_prev_pos_).norm();
+                analytics_prev_pos_  = state_point.pos;
+            }
+
+            // DOP ratio (set by h_share_model when dop_flag is on)
+            analytics_dop_ratio_ = (dop_flag && down_dop > 0.0) ? dop_ratio : 0.0;
+            analytics_down_dop_  = dop_flag ? down_dop : 0.0;
+
+            // Residual statistics from res_last[]
+            if (effct_feat_num > 1) {
+                double r_sum = 0.0;
+                for (int i = 0; i < effct_feat_num; i++) r_sum += res_last[i];
+                double r_mean = r_sum / effct_feat_num;
+                double var = 0.0;
+                for (int i = 0; i < effct_feat_num; i++) {
+                    double d = res_last[i] - r_mean;
+                    var += d * d;
+                }
+                analytics_res_mean_ = r_mean;
+                analytics_res_std_  = std::sqrt(var / (effct_feat_num - 1));
+            }
+
+            PublishAnalytics();
+            // -----------------------------------------------
         }
     }
 
+
+    void PublishAnalytics()
+    {
+        double now = omp_get_wtime();
+
+        // Sensor frequency: update once per ~1 second window
+        if (analytics_freq_t0_ < 0.0) analytics_freq_t0_ = now;
+        double elapsed_freq = now - analytics_freq_t0_;
+        if (elapsed_freq >= 1.0) {
+            analytics_imu_freq_ = (int64_t)std::round(analytics_imu_cnt_w_ / elapsed_freq);
+            analytics_lid_freq_ = (int64_t)std::round(analytics_lid_cnt_w_ / elapsed_freq);
+            analytics_imu_cnt_w_ = 0;
+            analytics_lid_cnt_w_ = 0;
+            analytics_freq_t0_   = now;
+        }
+
+        fast_lio::msg::LocAnalytics msg;
+
+        // --- Sensor frequencies ---
+        msg.imu_freq = analytics_imu_freq_;
+        msg.lid_freq = analytics_lid_freq_;
+
+        // --- Scan / map statistics ---
+        msg.scan_size       = (int64_t)feats_undistort->points.size();
+        msg.down_size       = (int64_t)feats_down_size;
+        msg.map_size        = (int64_t)kdtree_size_st;
+        msg.map_valid_size  = (int64_t)ikdtree.validnum();
+        msg.new_idxs        = analytics_map_updated_ ? (int64_t)add_point_size : 0;
+        msg.buffer_size     = analytics_pre_lidar_buf_;
+        msg.imu_buffer_size = analytics_pre_imu_buf_;
+        msg.scan_time       = lidar_mean_scantime;
+
+        // --- Adaptive downsampling ---
+        msg.filter_size_surf_ad = filter_size_surf_ad;
+        msg.point_filter_num_ad = (int64_t)point_filter_num_ad;
+
+        // --- Feature matching ---
+        msg.num_feats   = (int64_t)effct_feat_num;
+        msg.num_reject  = (int64_t)(feats_down_size - effct_feat_num);
+        msg.match_ratio = (feats_down_size > 0)
+                          ? (double)effct_feat_num / feats_down_size : 0.0;
+
+        // --- Residual statistics ---
+        msg.res_mean = analytics_res_mean_;
+        msg.res_std  = analytics_res_std_;
+
+        // --- IESEKF ---
+        msg.lidar_meas_cov = lidar_meas_cov;
+        {
+            auto P = kf.get_P();
+            // In esekfom state order: rot[0-2], pos[3-5]
+            msg.pos_cov = P(3, 3) + P(4, 4) + P(5, 5);
+            msg.rot_cov = P(0, 0) + P(1, 1) + P(2, 2);
+        }
+
+        // --- Geometry quality (DOP) ---
+        msg.scan_dop     = dop_flag ? scan_dop          : 0.0;
+        msg.down_dop     = dop_flag ? analytics_down_dop_: 0.0;
+        msg.matching_dop = dop_flag ? matching_dop       : 0.0;
+        msg.dop_ratio    = analytics_dop_ratio_;
+
+        // --- IMU state estimates ---
+        msg.vel_norm      = state_point.vel.norm();
+        msg.acc_bias_norm = state_point.ba.norm();
+        msg.gyr_bias_norm = state_point.bg.norm();
+
+        // --- Time sync offsets ---
+        msg.lid_offset = time_diff_lidar_to_imu;
+        msg.imu_offset = timediff_lidar_wrt_imu;
+
+        // --- Per-frame processing time ---
+        msg.imu_time   = analytics_imu_time_;
+        msg.state_time = analytics_state_time_;
+        msg.map_time   = analytics_map_time_;
+        msg.total_time = analytics_total_time_;
+
+        // --- Cumulative timing statistics ---
+        msg.imu_mean   = analytics_mean_imu_;
+        msg.state_mean = analytics_mean_state_;
+        msg.map_mean   = analytics_mean_map_;
+        msg.total_mean = analytics_mean_total_;
+        msg.imu_max    = analytics_max_imu_;
+        msg.state_max  = analytics_max_state_;
+        msg.map_max    = analytics_max_map_;
+        msg.total_max  = analytics_max_total_;
+
+        // --- Keyframe ---
+        msg.kf_count     = (int64_t)kf_idx_;
+        msg.kf_dist_last = (pos_lid - prev_kf_pos).norm();
+
+        // --- System resources ---
+        msg.run_time  = (int64_t)std::round(now - analytics_start_time_);
+        msg.traj_dist = (int64_t)std::round(analytics_traj_dist_);
+        msg.ram_usage = (int64_t)std::round(ComputeRamUsageMB());
+        msg.cpu_usage = (int64_t)std::round(ComputeCpuPercent());
+
+        // --- Localization status ---
+        msg.is_initialized = initial_flag;
+        msg.map_updated    = analytics_map_updated_;
+
+        // --- Wheel odometry ---
+        msg.linear_velo  = linear_velo;
+        msg.angular_velo = angular_velo;
+
+        pub_analytics_->publish(msg);
+    }
 
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
@@ -1388,7 +1645,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
-    rclcpp::Publisher<fast_lio::msg::Frame>::SharedPtr pubKeyFrame;    
+    rclcpp::Publisher<fast_lio::msg::Frame>::SharedPtr pubKeyFrame;
+    rclcpp::Publisher<fast_lio::msg::LocAnalytics>::SharedPtr pub_analytics_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initPose;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom;
