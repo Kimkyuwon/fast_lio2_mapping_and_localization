@@ -1623,7 +1623,7 @@ private:
 
         // --- System resources ---
         msg.run_time  = (int64_t)std::round(now - analytics_start_time_);
-        msg.traj_dist = (int64_t)std::round(analytics_traj_dist_);
+        msg.traj_dist = analytics_traj_dist_;
         msg.ram_usage = (int64_t)std::round(ComputeRamUsageMB());
         msg.cpu_usage = (int64_t)std::round(ComputeCpuPercent());
 

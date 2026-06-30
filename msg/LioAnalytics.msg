@@ -77,6 +77,6 @@ float64 kf_dist_last  # Distance traveled since last keyframe (m)
 
 # --- System Resources ---
 int64 run_time   # Node uptime since first scan (sec)
-int64 traj_dist  # Total trajectory distance traveled (m)
+float64 traj_dist  # Total trajectory distance traveled (m)
 int64 ram_usage  # Process RSS memory usage (MB)
 int64 cpu_usage  # Process CPU usage (%, normalized by core count)
