@@ -1502,12 +1502,15 @@ private:
             if (analytics_map_time_   > analytics_max_map_)   analytics_max_map_   = analytics_map_time_;
             if (analytics_total_time_ > analytics_max_total_) analytics_max_total_ = analytics_total_time_;
 
-            // Trajectory distance
+            // Trajectory distance (accumulate only when moving)
             if (!analytics_pos_init_) {
                 analytics_prev_pos_ = state_point.pos;
                 analytics_pos_init_ = true;
             } else {
-                analytics_traj_dist_ += (state_point.pos - analytics_prev_pos_).norm();
+                const double vel_norm = state_point.vel.norm();
+                if (vel_norm >= 0.2) {
+                    analytics_traj_dist_ += (state_point.pos - analytics_prev_pos_).norm();
+                }
                 analytics_prev_pos_  = state_point.pos;
             }
 
