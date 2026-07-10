@@ -1131,18 +1131,21 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 double ComputeRamUsageMB()
 {
-    long rss = 0;
     FILE *fp = fopen("/proc/self/status", "r");
     if (!fp) return 0.0;
-    char line[128];
+    char line[256];
+    long long rss_kb = 0;
     while (fgets(line, sizeof(line), fp)) {
         if (strncmp(line, "VmRSS:", 6) == 0) {
-            sscanf(line + 6, "%ld", &rss);
+            if (sscanf(line + 6, " %lld", &rss_kb) == 1) {
+                fclose(fp);
+                return rss_kb / 1024.0;  // kB → MB
+            }
             break;
         }
     }
     fclose(fp);
-    return rss / 1024.0;
+    return 0.0;
 }
 
 double ComputeCpuPercent()
@@ -1624,8 +1627,8 @@ private:
         // --- System resources ---
         msg.run_time  = (int64_t)std::round(now - analytics_start_time_);
         msg.traj_dist = analytics_traj_dist_;
-        msg.ram_usage = (int64_t)std::round(ComputeRamUsageMB());
-        msg.cpu_usage = (int64_t)std::round(ComputeCpuPercent());
+        msg.ram_usage = ComputeRamUsageMB();
+        msg.cpu_usage = (int64_t)std::round(ComputeCpuPercent());  // system-wide %, 0-100
 
         // --- Localization status ---
         msg.is_initialized = initial_flag;
