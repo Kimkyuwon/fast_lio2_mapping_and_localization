@@ -74,11 +74,10 @@
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
-#define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
-#define DOP_VOXEL_SIZE      (2.0)
+#define DOP_VOXEL_SIZE      (2.5)
+#define MEAN_RANGE          (10.0)
 #define MIN_VALID_DOP       (100.0)
-#define TUKEY_LOSS_C        (3.0)
 #define MAX_PATH_LENGTH     (5000)
 
 /*** Time Log Variables ***/
@@ -210,7 +209,7 @@ int kf_idx_ = 0;
 
 //  DOP //
 bool dop_flag = false;
-double scan_dop, matching_dop, lidar_meas_cov;
+double scan_dop, matching_dop, lidar_meas_cov, v_fov;
 
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
@@ -654,7 +653,13 @@ double computeDOP(const PointCloudXYZI::Ptr& cloud, Eigen::Vector3d pos)
     {
         pdop = MIN_VALID_DOP;
     }
-    return pdop;
+    double uz = 0.5 - sin(2*deg2rad(v_fov))/(4*deg2rad(v_fov));
+    double g_floor = sqrt(4/(1-uz) + (1/uz));
+    double R_eff_sq = MEAN_RANGE*MEAN_RANGE - p_pre->blind*p_pre->blind;
+    double N_typical = 4.0 * M_PI * std::sin(deg2rad(v_fov)) * R_eff_sq / (DOP_VOXEL_SIZE * DOP_VOXEL_SIZE);
+    double rho = pdop * sqrt(N_typical)/g_floor;
+
+    return rho;
 }
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
@@ -682,6 +687,94 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
+}
+
+double computeNormalDOP(const PointCloudXYZI::Ptr& cloud, Eigen::Vector3d pos)
+{
+    // ---- 파라미터 ----
+    const double NDOP_VOXEL_SIZE   = 2.0;    // 복셀 크기
+    const int    MIN_PTS_PER_VOXEL = 5;      // 복셀 공분산 신뢰 위한 최소 포인트
+    const double LAMBDA_FLOOR      = 5e-3;   // M_n 등방 정규화 (절벽 제거 + 표본부족 안정화)
+    const double MIN_WEIGHT_SUM    = 1.0;    // planarity 가중합 하한 (이 아래면 관측 정보 부재)
+    const double NDOP_UNOBSERVABLE = 15.0;   // 관측 면 부재 시 반환값
+    const double NDOP_CLAMP        = 100.0;  // 최종 안전 상한
+
+    struct VoxelAccum {
+        Eigen::Vector3d sum       = Eigen::Vector3d::Zero();
+        Eigen::Matrix3d sum_outer = Eigen::Matrix3d::Zero();
+        int             count     = 0;
+    };
+
+    std::unordered_map<int64_t, VoxelAccum> voxel_map;
+    voxel_map.reserve(cloud->points.size() / 10 + 1);
+
+    auto voxelKey = [&](double x, double y, double z) -> int64_t {
+        int64_t ix = static_cast<int64_t>(std::floor(x / NDOP_VOXEL_SIZE));
+        int64_t iy = static_cast<int64_t>(std::floor(y / NDOP_VOXEL_SIZE));
+        int64_t iz = static_cast<int64_t>(std::floor(z / NDOP_VOXEL_SIZE));
+        return ((ix & 0x1FFFFF) << 42) | ((iy & 0x1FFFFF) << 21) | (iz & 0x1FFFFF);
+    };
+
+    // 단일 순회: blind 필터 + 복셀 누적 (O(N))
+    for (const auto& p : cloud->points)
+    {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        double dx = p.x - pos(0), dy = p.y - pos(1), dz = p.z - pos(2);
+        double r  = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (r < p_pre->blind || std::isnan(r))    continue;
+
+        Eigen::Vector3d v(p.x, p.y, p.z);
+        auto& acc = voxel_map[voxelKey(p.x, p.y, p.z)];
+        acc.sum       += v;
+        acc.sum_outer += v * v.transpose();
+        acc.count     += 1;
+    }
+
+    // 복셀별 법선 추정 -> M_n = sum(planarity * n n^T)
+    //   * 이진 채택 대신 planarity를 연속 가중치로 사용
+    //   * 경계 복셀이 프레임마다 켜졌다/꺼졌다 하는 진동(요동) 제거
+    //   * 물리적 의미: 확실한 면일수록 point-to-plane 구속 신뢰도 높음
+    Eigen::Matrix3d M_n = Eigen::Matrix3d::Zero();
+    double weight_sum = 0.0;
+
+    for (auto& kv : voxel_map)
+    {
+        VoxelAccum& acc = kv.second;
+        if (acc.count < MIN_PTS_PER_VOXEL) continue;
+
+        Eigen::Vector3d mean = acc.sum / acc.count;
+        Eigen::Matrix3d cov  = acc.sum_outer / acc.count - mean * mean.transpose();
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+        Eigen::Vector3d eigvals = es.eigenvalues();   // 오름차순 l0<=l1<=l2
+
+        double planarity = (eigvals(1) - eigvals(0)) / (eigvals(2) + 1e-9);
+        if (planarity <= 0.0) continue;   // 완전 비평면만 제외
+        if (planarity > 1.0) planarity = 1.0;
+
+        Eigen::Vector3d normal = es.eigenvectors().col(0);  // 최소 고유값 방향 = 법선
+        M_n        += planarity * (normal * normal.transpose());
+        weight_sum += planarity;
+    }
+
+    // 관측 면 부재: 측정 불가
+    if (weight_sum < MIN_WEIGHT_SUM)
+        return NDOP_UNOBSERVABLE;
+
+    // Tikhonov 정규화: weight_sum으로 스케일 (trace(M_n) == weight_sum)
+    Eigen::Matrix3d M_reg = M_n + (LAMBDA_FLOOR * weight_sum) * Eigen::Matrix3d::Identity();
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es_n(M_reg);
+    double lambda_min = es_n.eigenvalues().minCoeff();
+
+    double ndop;
+    if (lambda_min <= 1e-12 || std::isnan(lambda_min))
+        ndop = NDOP_CLAMP;
+    else
+        ndop = std::sqrt(1.0 / lambda_min);
+
+    if (ndop > NDOP_CLAMP) ndop = NDOP_CLAMP;
+    return ndop;
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -742,35 +835,6 @@ void PublishKeyFrame(rclcpp::Publisher<fast_lio::msg::Frame>::SharedPtr pubKeyFr
     kfMsg.frame_idx = kf_idx_;
     pubKeyFrame->publish(kfMsg);
     kf_idx_++;
-}
-
-
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
-{
-    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
-
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointLidarToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
-    }
-    *pcl_wait_pub += *laserCloudWorld;
-
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "odom";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "odom";
-    // pubLaserCloudMap->publish(laserCloudMap);
 }
 
 void save_to_pcd()
@@ -925,15 +989,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (dop_flag)
     {
         matching_dop = computeDOP(dop_cloud, Eigen::Vector3d(0,0,0));
-        double dop_scale = 1;
-        double c = 50.0;
-        double r = matching_dop;
 
-        //tukey loss function
-        double scale = std::pow(c,2)*(1-std::pow((1-std::pow((r/c),2)),3))*dop_scale;
-        if (r >= c)  scale = std::pow(c,2)*dop_scale;   
-
-        lidar_meas_cov = scale * LASER_POINT_COV;
+        lidar_meas_cov = matching_dop * LASER_POINT_COV;
     }
 
     if (effct_feat_num < 1)
@@ -1087,12 +1144,11 @@ public:
         point_filter_num = this->declare_parameter("point_filter_num", 2);
         p_pre->feature_enabled = this->declare_parameter("feature_extract_enable", false);
         extrinsic_est_en = this->declare_parameter("mapping.extrinsic_est_en", true);
-        pcd_save_en = this->declare_parameter("pcd_save.pcd_save_en", false);
-        pcd_save_interval = this->declare_parameter("pcd_save.interval", -1);
         extrinT = this->declare_parameter("mapping.extrinsic_T", vector<double>());
         extrinR = this->declare_parameter("mapping.extrinsic_R", vector<double>());
         extrin_g2o_T = this->declare_parameter("mapping.extrinsic_g2o_T", vector<double>());
         extrin_g2o_R = this->declare_parameter("mapping.extrinsic_g2o_R", vector<double>());
+        v_fov = this->declare_parameter("posegraph.fov_u", 15.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -1123,14 +1179,6 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
-        // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-        if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-        else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
@@ -1145,7 +1193,6 @@ public:
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", qos_slam);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", qos_viz);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", qos_slam);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", qos_viz);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_slam);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", qos_slam);
         pubKeyFrame = this->create_publisher<fast_lio::msg::Frame> ("/key_frame", qos_slam);
@@ -1161,17 +1208,12 @@ public:
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
-
-        map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
     ~LaserMappingNode()
     {
-        fout_out.close();
-        fout_pre.close();
     }
 
 private:
@@ -1222,15 +1264,8 @@ private:
             if (dop_flag)
             {
                 scan_dop = computeDOP(feats_undistort, Eigen::Vector3d(0,0,0));
-                double dop_scale = 1;
-                double c = TUKEY_LOSS_C;
-                double r = scan_dop;
-
-                //tukey loss function
-                double scale = std::pow(c,2)*(1-std::pow((1-std::pow((r/c),2)),3))*dop_scale;
-                if (r >= c)  scale = std::pow(c,2)*dop_scale; 
                 
-                double voxel_scale = 1.0/scale;
+                double voxel_scale = 1.0/scan_dop;
                 filter_size_surf_ad = voxel_scale * filter_size_surf_min;
                 if (filter_size_surf_ad < 0.05)  filter_size_surf_ad = 0.05;
                 else if (filter_size_surf_ad > 1.0) filter_size_surf_ad = 1.0;
@@ -1250,7 +1285,6 @@ private:
                 }
             }
 
-            
             downSizeFilterSurf.setLeafSize(filter_size_surf_ad, filter_size_surf_ad, filter_size_surf_ad);
             downSizeFilterSurf.setInputCloud(temp_pointCloud);
             downSizeFilterSurf.filter(*feats_down_body);
@@ -1274,10 +1308,7 @@ private:
             }
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
-            
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
-            /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
@@ -1286,10 +1317,6 @@ private:
             
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
-
-            V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
-            <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
             if(0) // If you need to see map point, change to "if(1)"
             {
@@ -1331,7 +1358,6 @@ private:
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /******* Publish key frame *******/
             double kf_dist = (pos_lid - prev_kf_pos).norm();
@@ -1398,11 +1424,6 @@ private:
             PublishAnalytics();
             // -----------------------------------------------
         }
-    }
-
-    void map_publish_callback()
-    {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
     void PublishAnalytics()
@@ -1503,22 +1524,6 @@ private:
         pub_analytics_->publish(msg);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
-    {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
-        }
-        else
-        {
-            res->success = false;
-            res->message = "Map save disabled.";
-        }
-    }
-
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -1544,7 +1549,6 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
-    ofstream fout_pre, fout_out, fout_dbg;
 };
 
 int main(int argc, char** argv)

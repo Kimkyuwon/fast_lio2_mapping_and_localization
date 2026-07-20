@@ -74,11 +74,10 @@
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
-#define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
-#define DOP_VOXEL_SIZE      (2.0)
+#define DOP_VOXEL_SIZE      (2.5)
+#define MEAN_RANGE          (10.0)
 #define MIN_VALID_DOP       (100.0)
-#define TUKEY_LOSS_C        (3.0)
 #define MAX_PATH_LENGTH     (5000)
 
 /*** Time Log Variables ***/
@@ -214,7 +213,7 @@ int kf_idx_ = 0;
 
 //  DOP //
 bool dop_flag = false;
-double scan_dop, down_dop, matching_dop, dop_ratio, lidar_meas_cov;
+double scan_dop, down_dop, matching_dop, dop_ratio, lidar_meas_cov, v_fov;
 
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
@@ -816,8 +815,15 @@ double computeDOP(const PointCloudXYZI::Ptr& cloud, Eigen::Vector3d pos)
     if (pdop == 0 || pdop > MIN_VALID_DOP || std::isnan(pdop))
     {
         pdop = MIN_VALID_DOP;
-    }
-    return pdop;
+    }    
+    
+    double uz = 0.5 - sin(2*deg2rad(v_fov))/(4*deg2rad(v_fov));
+    double g_floor = sqrt(4/(1-uz) + (1/uz));
+    double R_eff_sq = MEAN_RANGE*MEAN_RANGE - p_pre->blind*p_pre->blind;
+    double N_typical = 4.0 * M_PI * std::sin(deg2rad(v_fov)) * R_eff_sq / (DOP_VOXEL_SIZE * DOP_VOXEL_SIZE);
+    double rho = pdop * sqrt(N_typical)/g_floor;
+
+    return rho;
 }
 
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
@@ -1043,16 +1049,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (dop_flag)
     {
         matching_dop = computeDOP(dop_cloud, Eigen::Vector3d(0,0,0));
-        double dop_scale = 1;
-        double c = 50.0;
-        double r = matching_dop;
 
-        //tukey loss function
-        double scale = std::pow(c,2)*(1-std::pow((1-std::pow((r/c),2)),3))*dop_scale;
-        if (r >= c)  scale = std::pow(c,2)*dop_scale;   
-
-        lidar_meas_cov = scale * LASER_POINT_COV;
-        dop_ratio = matching_dop/down_dop;
+        lidar_meas_cov = matching_dop * LASER_POINT_COV;
+        dop_ratio = scan_dop/matching_dop;
     }
 
     if (effct_feat_num < 1)
@@ -1064,7 +1063,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     if (!initial_flag)
     {
-        if (dop_ratio <= 1.2 )
+        if (dop_ratio >= 0.8 )
         {
             cout<<"Position is Initialized."<<endl;
             initial_flag = true;
@@ -1220,6 +1219,7 @@ public:
         extrin_g2o_T = this->declare_parameter("localization.extrinsic_g2o_T", vector<double>());
         extrin_g2o_R = this->declare_parameter("localization.extrinsic_g2o_R", vector<double>());
         odom_mode = this->declare_parameter("localization.odom_mode", 0);
+        v_fov = this->declare_parameter("localization.fov_u", 15.0);
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -1354,15 +1354,8 @@ private:
             if (dop_flag)
             {
                 scan_dop = computeDOP(feats_undistort, Eigen::Vector3d(0,0,0));
-                double dop_scale = 1;
-                double c = TUKEY_LOSS_C;
-                double r = scan_dop;
-
-                //tukey loss function
-                double scale = std::pow(c,2)*(1-std::pow((1-std::pow((r/c),2)),3))*dop_scale;
-                if (r >= c)  scale = std::pow(c,2)*dop_scale; 
                 
-                double voxel_scale = 1.0/scale;
+                double voxel_scale = 1.0/scan_dop;
                 filter_size_surf_ad = voxel_scale * filter_size_surf_min;
                 if (filter_size_surf_ad < 0.05)  filter_size_surf_ad = 0.05;
                 else if (filter_size_surf_ad > 1.0) filter_size_surf_ad = 1.0;
@@ -1445,7 +1438,7 @@ private:
             /*** add the feature points to map kdtree ***/
             analytics_map_time_    = 0.0;
             analytics_map_updated_ = false;
-            if (initial_flag && dop_ratio > 1.4)
+            if (initial_flag && dop_ratio < 0.6)
             {
                 double t_map_start = omp_get_wtime();
                 map_incremental();
