@@ -46,10 +46,6 @@ float64 vel_norm      # Estimated velocity magnitude (state_point.vel.norm(), m/
 float64 acc_bias_norm # Accelerometer bias magnitude (state_point.ba.norm())
 float64 gyr_bias_norm # Gyroscope bias magnitude (state_point.bg.norm())
 
-# --- Time Sync Offsets (sec) ---
-float64 lid_offset # LiDAR hardware time offset (time_diff_lidar_to_imu)
-float64 imu_offset # IMU-LiDAR real-time sync error (timediff_lidar_wrt_imu)
-
 # --- Per-frame Processing Time (sec) ---
 float64 imu_time   # IMU undistortion time (p_imu->Process)
 float64 state_time # EKF state update time (update_iterated_dyn_share_modified)

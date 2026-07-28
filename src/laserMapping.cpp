@@ -38,6 +38,7 @@
 #include <thread>
 #include <fstream>
 #include <csignal>
+#include <algorithm>
 #include <chrono>
 #include <unistd.h>
 #include <Python.h>
@@ -155,6 +156,7 @@ double filter_size_surf_min = 0, filter_size_surf_ad = 0, filter_size_map_min = 
 double cube_len = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, point_filter_num = 0, point_filter_num_ad = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+int    MAX_MAP_POINTS = 200000; // 지도 포인트 총 개수 상한 (초과 시 오래된 포인트부터 삭제)
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, scan_body_pub_en = false;
@@ -574,6 +576,10 @@ void map_incremental()
     {
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+        /* 지도 삽입 시각 기록 (개수 기반 오래된 순 삭제용).
+           lidar_end_time은 절대(epoch) 시각이라 float curvature에 그대로 넣으면
+           유효자릿수 부족으로 뭉개지므로, 시작 시점 기준 경과 시간으로 저장한다. */
+        feats_down_world->points[i].curvature = static_cast<float>(lidar_end_time - first_lidar_time);
         /* decide if need add to map */
         if (!Nearest_Points[i].empty() && flg_EKF_inited)
         {
@@ -615,6 +621,38 @@ void map_incremental()
     // kdtree_incremental_time 누적
     total_kdtree_incremental_time += kdtree_incremental_time;
     kdtree_incremental_count++;
+}
+
+// 지도 포인트 총 개수가 MAX_MAP_POINTS를 넘으면 가장 오래 전에 삽입된 포인트부터 삭제한다.
+// (lasermap_fov_segment의 이동 박스 기반 삭제와는 별개의, 개수 상한 안전장치)
+void trim_map_by_count()
+{
+    if (MAX_MAP_POINTS <= 0) return;
+
+    int total = ikdtree.validnum();
+    if (total <= MAX_MAP_POINTS) return;
+
+    double trim_start = omp_get_wtime();
+
+    PointVector all_points;
+    ikdtree.flatten(ikdtree.Root_Node, all_points, NOT_RECORD);
+
+    // 상한의 95%까지만 남기도록 여유를 둬서 트리밍이 매 프레임 반복되지 않게 한다.
+    const int target = static_cast<int>(MAX_MAP_POINTS * 0.95);
+    const int num_to_delete = static_cast<int>(all_points.size()) - target;
+    if (num_to_delete <= 0) return;
+
+    // curvature(삽입 경과 시각) 기준 오름차순 부분정렬 -> 가장 오래된 num_to_delete개를 앞으로 모음
+    std::nth_element(all_points.begin(), all_points.begin() + num_to_delete, all_points.end(),
+        [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
+
+    PointVector oldest(all_points.begin(), all_points.begin() + num_to_delete);
+    ikdtree.Delete_Points(oldest);
+
+    double trim_time = omp_get_wtime() - trim_start;
+    std::cout << "[map_incremental] Map point count trimmed: " << total
+               << " -> " << ikdtree.validnum()
+               << " (" << oldest.size() << " removed, " << trim_time * 1000.0 << " ms)" << std::endl;
 }
 
 double computeDOP(const PointCloudXYZI::Ptr& cloud, Eigen::Vector3d pos)
@@ -835,12 +873,6 @@ void PublishKeyFrame(rclcpp::Publisher<fast_lio::msg::Frame>::SharedPtr pubKeyFr
     kfMsg.frame_idx = kf_idx_;
     pubKeyFrame->publish(kfMsg);
     kf_idx_++;
-}
-
-void save_to_pcd()
-{
-    pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
 template<typename T>
@@ -1130,6 +1162,7 @@ public:
         filter_size_map_min = this->declare_parameter("filter_size_map", 0.5);
         cube_len = this->declare_parameter("cube_side_length", 200.);
         DET_RANGE = this->declare_parameter("mapping.det_range", 300.);
+        MAX_MAP_POINTS = this->declare_parameter("mapping.max_map_points", 200000);
         gyr_cov = this->declare_parameter("mapping.gyr_cov", 0.1);
         acc_cov = this->declare_parameter("mapping.acc_cov", 0.1);
         b_gyr_cov = this->declare_parameter("mapping.b_gyr_cov", 0.0001);
@@ -1191,7 +1224,7 @@ public:
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos_slam, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", qos_slam);
-        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", qos_viz);
+        pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", qos_slam);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", qos_slam);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_slam);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", qos_slam);
@@ -1234,11 +1267,21 @@ private:
             
             double process_start = omp_get_wtime();
 
-
+            PointCloudXYZI::Ptr temp_feats_undistort(new PointCloudXYZI());
             double t_imu_start = omp_get_wtime();
-            p_imu->Process(Measures, kf, feats_undistort);
+            p_imu->Process(Measures, kf, temp_feats_undistort);
             analytics_imu_time_ = omp_get_wtime() - t_imu_start;
             state_point = kf.get_x();
+
+            feats_undistort->points.clear();
+            feats_undistort->points.reserve(temp_feats_undistort->points.size());
+            const double det_range_sq = static_cast<double>(DET_RANGE) * DET_RANGE;
+            for (const auto &p : temp_feats_undistort->points)
+            {
+                const double range_sq = p.x * p.x + p.y * p.y + p.z * p.z;
+                if (range_sq <= det_range_sq)
+                    feats_undistort->points.push_back(p);
+            }
 
             /*** Transform feats_undistort from LiDAR frame to body frame ***/
             Eigen::Affine3f body_TF = Eigen::Affine3f::Identity();
@@ -1351,6 +1394,7 @@ private:
             /*** add the feature points to map kdtree ***/
             double t_map_start = omp_get_wtime();
             map_incremental();
+            trim_map_by_count();
             analytics_map_time_ = omp_get_wtime() - t_map_start;
             
             /******* Publish points *******/
@@ -1376,7 +1420,8 @@ private:
             if (analytics_start_time_ < 0.0)
                 analytics_start_time_ = omp_get_wtime();
 
-            analytics_total_time_ = analytics_imu_time_ + analytics_state_time_ + analytics_map_time_;
+            analytics_total_time_ = current_process_time;
+            // analytics_total_time_ = analytics_imu_time_ + analytics_state_time_ + analytics_map_time_;
 
             // Cumulative timing
             analytics_frame_cnt_++;
@@ -1488,10 +1533,6 @@ private:
         msg.vel_norm      = state_point.vel.norm();
         msg.acc_bias_norm = state_point.ba.norm();
         msg.gyr_bias_norm = state_point.bg.norm();
-
-        // --- Time sync offsets ---
-        msg.lid_offset = time_diff_lidar_to_imu;
-        msg.imu_offset = timediff_lidar_wrt_imu;
 
         // --- Per-frame processing time ---
         msg.imu_time    = analytics_imu_time_;

@@ -36,6 +36,7 @@
 #include <mutex>
 #include <math.h>
 #include <thread>
+#include <atomic>
 #include <fstream>
 #include <csignal>
 #include <chrono>
@@ -54,6 +55,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/passthrough.h>
 #include <pcl/io/pcd_io.h>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -71,6 +73,7 @@
 #include <sys/times.h>
 #include <sys/resource.h>
 #include <cfloat>
+#include <unordered_set>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -153,6 +156,7 @@ string map_file_path, lid_topic, imu_topic, odom_topic;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_surf_min = 0, filter_size_surf_ad = 0, filter_size_map_min = 0, fov_deg = 0;
+double map_crop_xy_range = 50.0;  // /Laser_map publish: 현재 pose 중심 x,y 전역좌표 crop 범위 (m, 전체 폭)
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 double linear_velo, angular_velo, diff_vel;
 double dt, curr_odom_time, prev_odom_time;
@@ -170,8 +174,6 @@ vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
 vector<double>       extrinT(3, 0.0);
 vector<double>       extrinR(9, 0.0);
-vector<double>       extrin_g2o_T(3, 0.0);
-vector<double>       extrin_g2o_R(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
@@ -182,8 +184,26 @@ PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
-PointCloudXYZI::Ptr laserCloudMap(new PointCloudXYZI(100000, 1));
+PointCloudXYZI::Ptr laserCloudMap(new PointCloudXYZI());
+PointCloudXYZI::Ptr laserCloudMapCropped(new PointCloudXYZI());
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
+
+// laserCloudMapCropped에 실제로 들어있는 점들의 2D 복셀 점유 여부를 추적하는 해시셋
+// (ikdtree 증분 add/delete 시 "이미 존재하는 영역"을 판별하기 위해 사용)
+std::unordered_set<int64_t> croppedMapVoxelOccupancy;
+
+// 크롭-diff 맵 갱신을 20ms 주기의 timer_callback과 분리된 백그라운드 스레드에서 실행하기 위한 동기화 장치.
+// - ikdtree_write_mutex: ikdtree에 대한 모든 쓰기(Add_Points/Delete_Point_Boxes/Build) 호출을 직렬화.
+//   (ikdtree.Search()는 이 mutex로 보호하지 않음 — ikd-Tree 자체가 "단일 writer + 내부 비동기 rebuild 스레드 +
+//    동시 reader" 조합만 스레드-세이프를 보장하므로, 외부 writer가 2개(=map_incremental()과 크롭 워커) 동시에
+//    돌지 않도록만 막아주면 된다.)
+// - cropped_map_mutex: laserCloudMapCropped / croppedMapVoxelOccupancy 접근 보호
+//   (온라인 병합 블록(메인 스레드)과 크롭 워커(백그라운드 스레드)가 동시에 건드릴 수 있음)
+std::mutex ikdtree_write_mutex;
+std::mutex cropped_map_mutex;
+std::atomic<bool> crop_update_in_progress{false};
+std::atomic<bool> crop_update_just_finished{false};
+std::thread crop_worker_thread;
 
 pcl::VoxelGrid<PointType> downSizeFilterSurf;
 pcl::VoxelGrid<PointType> downSizeFilterMap;
@@ -364,6 +384,236 @@ void points_cache_collect()
     ikdtree.acquire_removed_points(points_history);
 }
 
+// x,y 좌표를 resolution(=filter_size_map_min) 해상도의 2D 복셀 키로 변환
+// (x, y 각각 int32 범위를 커버하면 충돌 없이 하나의 int64_t로 인코딩 가능)
+inline int64_t voxelKey2D(double x, double y, double resolution)
+{
+    int64_t ix = static_cast<int64_t>(std::floor(x / resolution));
+    int64_t iy = static_cast<int64_t>(std::floor(y / resolution));
+    return (ix & 0x7FFFFFFF) | ((iy & 0x7FFFFFFF) << 31);
+}
+
+// old box(중심 ocx,ocy / half_range h) \ new box(중심 ncx,ncy / half_range h)를
+// 최대 2개의 정확한 직사각형(BoxPointType)으로 분해. z는 무제한으로 설정한다.
+// (크롭 창은 x,y 평면 기준이므로 z 방향으로는 제한을 두지 않음)
+std::vector<BoxPointType> computeLeavingBoxes(double ocx, double ocy, double ncx, double ncy, double h)
+{
+    std::vector<BoxPointType> boxes;
+    double old_xmin = ocx - h, old_xmax = ocx + h;
+    double old_ymin = ocy - h, old_ymax = ocy + h;
+    double new_xmin = ncx - h, new_xmax = ncx + h;
+    double new_ymin = ncy - h, new_ymax = ncy + h;
+
+    auto makeBox = [](double xmin, double xmax, double ymin, double ymax) {
+        BoxPointType b;
+        b.vertex_min[0] = (float)xmin; b.vertex_max[0] = (float)xmax;
+        b.vertex_min[1] = (float)ymin; b.vertex_max[1] = (float)ymax;
+        b.vertex_min[2] = -FLT_MAX;    b.vertex_max[2] = FLT_MAX;
+        return b;
+    };
+
+    // X축에서 old에만 있는 구간 (없으면 skip)
+    bool x_only_valid = false;
+    double x_only_min = old_xmin, x_only_max = old_xmax;
+    if (new_xmin > old_xmin) {
+        x_only_min = old_xmin;
+        x_only_max = std::min(new_xmin, old_xmax);
+        x_only_valid = (x_only_max > x_only_min);
+    } else if (new_xmax < old_xmax) {
+        x_only_min = std::max(new_xmax, old_xmin);
+        x_only_max = old_xmax;
+        x_only_valid = (x_only_max > x_only_min);
+    }
+    if (x_only_valid)
+        boxes.push_back(makeBox(x_only_min, x_only_max, old_ymin, old_ymax));
+
+    // Y축에서 old에만 있는 구간, X는 old∩new 범위로 제한 (위의 X strip과 겹치지 않게)
+    double x_ov_min = std::max(old_xmin, new_xmin);
+    double x_ov_max = std::min(old_xmax, new_xmax);
+    if (x_ov_max > x_ov_min) {
+        bool y_only_valid = false;
+        double y_only_min = old_ymin, y_only_max = old_ymax;
+        if (new_ymin > old_ymin) {
+            y_only_min = old_ymin;
+            y_only_max = std::min(new_ymin, old_ymax);
+            y_only_valid = (y_only_max > y_only_min);
+        } else if (new_ymax < old_ymax) {
+            y_only_min = std::max(new_ymax, old_ymin);
+            y_only_max = old_ymax;
+            y_only_valid = (y_only_max > y_only_min);
+        }
+        if (y_only_valid)
+            boxes.push_back(makeBox(x_ov_min, x_ov_max, y_only_min, y_only_max));
+    }
+    return boxes;
+}
+
+// timer_callback(20ms 주기)과 분리된 백그라운드 스레드에서 실행되는 크롭 맵/ikdtree 갱신 작업.
+// - is_first=true: laserCloudMap(pristine) 전체에서 최초 크롭 후 ikdtree.Build()
+// - is_first=false: 증분 add/delete로 크롭 창 이동 (ikdtree.Build() 재호출 없음)
+// 완료 시 prev_kf_pos/kf_flag를 갱신하고 crop_update_just_finished를 세팅한다.
+// (publish_map/PublishKeyFrame은 feats_undistort 등 매 스캔 갱신되는 전역 상태를 참조하므로
+//  이 스레드가 아닌, 완료를 감지한 메인 스레드(timer_callback)에서 호출한다.)
+void performCropUpdate(vect3 kf_pos_snapshot, bool is_first)
+{
+    const double half_range = map_crop_xy_range * 0.5;
+    const double cx = kf_pos_snapshot(0);
+    const double cy = kf_pos_snapshot(1);
+
+    if (is_first)
+    {
+        PointCloudXYZI::Ptr cropped(new PointCloudXYZI());
+        pcl::PassThrough<PointType> passX;
+        passX.setInputCloud(laserCloudMap);
+        passX.setFilterFieldName("x");
+        passX.setFilterLimits(cx - half_range, cx + half_range);
+        passX.filter(*cropped);
+
+        pcl::PassThrough<PointType> passY;
+        passY.setInputCloud(cropped);
+        passY.setFilterFieldName("y");
+        passY.setFilterLimits(cy - half_range, cy + half_range);
+        passY.filter(*cropped);
+
+        {
+            std::lock_guard<std::mutex> lk(ikdtree_write_mutex);
+            ikdtree.Build(cropped->points);
+        }
+        {
+            std::lock_guard<std::mutex> lk(cropped_map_mutex);
+            laserCloudMapCropped->points = cropped->points;
+            laserCloudMapCropped->width  = laserCloudMapCropped->points.size();
+            laserCloudMapCropped->height = 1;
+
+            croppedMapVoxelOccupancy.clear();
+            for (const auto &p : laserCloudMapCropped->points)
+                croppedMapVoxelOccupancy.insert(voxelKey2D(p.x, p.y, filter_size_map_min));
+        }
+    }
+    else
+    {
+        double t_step_start = omp_get_wtime();
+
+        // 1) 진입 후보 추출 (새 박스 전체를 한 번에 크롭 후, 해시로 이미 있는 점 제외)
+        PointCloudXYZI::Ptr newBoxCrop(new PointCloudXYZI());
+        pcl::PassThrough<PointType> passX;
+        passX.setInputCloud(laserCloudMap);
+        passX.setFilterFieldName("x");
+        passX.setFilterLimits(cx - half_range, cx + half_range);
+        passX.filter(*newBoxCrop);
+
+        pcl::PassThrough<PointType> passY;
+        passY.setInputCloud(newBoxCrop);
+        passY.setFilterFieldName("y");
+        passY.setFilterLimits(cy - half_range, cy + half_range);
+        passY.filter(*newBoxCrop);
+
+        double t_passthrough = omp_get_wtime();
+
+        PointVector entering;
+        entering.reserve(newBoxCrop->points.size());
+        {
+            std::lock_guard<std::mutex> lk(cropped_map_mutex);
+            for (const auto &p : newBoxCrop->points)
+            {
+                int64_t key = voxelKey2D(p.x, p.y, filter_size_map_min);
+                if (croppedMapVoxelOccupancy.count(key) == 0)
+                    entering.push_back(p);
+            }
+        }
+
+        double t_occupancy_filter = omp_get_wtime();
+
+        // 2) 이탈 영역 삭제 (순수 박스 산술, PassThrough 미사용)
+        std::vector<BoxPointType> leaving_boxes =
+            computeLeavingBoxes(prev_kf_pos(0), prev_kf_pos(1), cx, cy, half_range);
+
+        int size_before_delete = 0, valid_before_delete = 0;
+        int size_after_delete = 0, valid_after_delete = 0;
+        int size_after_add = 0, valid_after_add = 0;
+        double t_delete, t_add;
+        {
+            // 크롭-diff 워커와 map_incremental()이 동시에 ikdtree를 건드리지 않도록 직렬화.
+            std::lock_guard<std::mutex> lk(ikdtree_write_mutex);
+            size_before_delete  = ikdtree.size();
+            valid_before_delete = ikdtree.validnum();
+
+            if (!leaving_boxes.empty())
+                ikdtree.Delete_Point_Boxes(leaving_boxes);
+
+            t_delete = omp_get_wtime();
+            size_after_delete  = ikdtree.size();
+            valid_after_delete = ikdtree.validnum();
+
+            // 3) 추가 — entering은 점유 해시로 "기존에 없던 영역"으로 이미 확인된 점들이라
+            //    downsample_on=true의 점당 중복탐색(Search_by_range+Delete_by_range)이 불필요함.
+            //    map_incremental()의 PointNoNeedDownsample과 동일한 이유로 false 사용.
+            if (!entering.empty())
+                ikdtree.Add_Points(entering, false);
+
+            t_add = omp_get_wtime();
+            size_after_add  = ikdtree.size();
+            valid_after_add = ikdtree.validnum();
+        }
+
+        // 4) laserCloudMapCropped 북키핑: 이탈 영역 제거 + 진입 점 추가
+        {
+            std::lock_guard<std::mutex> lk(cropped_map_mutex);
+            auto in_any_box = [&leaving_boxes](const PointType &p) {
+                for (const auto &b : leaving_boxes)
+                {
+                    if (p.x >= b.vertex_min[0] && p.x <= b.vertex_max[0] &&
+                        p.y >= b.vertex_min[1] && p.y <= b.vertex_max[1])
+                        return true;
+                }
+                return false;
+            };
+            if (!leaving_boxes.empty())
+            {
+                PointCloudXYZI::Ptr remaining(new PointCloudXYZI());
+                remaining->points.reserve(laserCloudMapCropped->points.size());
+                for (const auto &p : laserCloudMapCropped->points)
+                {
+                    if (!in_any_box(p))
+                        remaining->points.push_back(p);
+                }
+                laserCloudMapCropped->points.swap(remaining->points);
+            }
+            for (const auto &p : entering)
+                laserCloudMapCropped->points.push_back(p);
+            laserCloudMapCropped->width  = laserCloudMapCropped->points.size();
+            laserCloudMapCropped->height = 1;
+
+            // 5) occupancyHash 갱신 (크롭 크기가 작으므로 전체 재구성 비용은 무시할 만함)
+            croppedMapVoxelOccupancy.clear();
+            for (const auto &p : laserCloudMapCropped->points)
+                croppedMapVoxelOccupancy.insert(voxelKey2D(p.x, p.y, filter_size_map_min));
+        }
+
+        double t_bookkeeping = omp_get_wtime();
+
+        cout << "[crop-diff][bg] total=" << (t_bookkeeping - t_step_start) * 1000.0 << "ms"
+             << " | passthrough=" << (t_passthrough - t_step_start) * 1000.0 << "ms"
+             << " | occ_filter=" << (t_occupancy_filter - t_passthrough) * 1000.0 << "ms"
+             << " (newBoxCrop=" << newBoxCrop->points.size() << ", entering=" << entering.size() << ")"
+             << " | delete=" << (t_delete - t_occupancy_filter) * 1000.0 << "ms"
+             << " (leaving_boxes=" << leaving_boxes.size()
+             << ", size/valid " << size_before_delete << "/" << valid_before_delete
+             << " -> " << size_after_delete << "/" << valid_after_delete << ")"
+             << " | add=" << (t_add - t_delete) * 1000.0 << "ms"
+             << " (size/valid -> " << size_after_add << "/" << valid_after_add << ")"
+             << " | bookkeeping=" << (t_bookkeeping - t_add) * 1000.0 << "ms"
+             << " (laserCloudMapCropped=" << laserCloudMapCropped->points.size() << ")"
+             << endl;
+    }
+
+    prev_kf_pos = kf_pos_snapshot;
+    kf_flag = true;
+
+    crop_update_just_finished = true;
+    crop_update_in_progress = false;
+}
+
 BoxPointType LocalMap_Points;
 bool Localmap_Initialized = false;
 void lasermap_fov_segment()
@@ -523,6 +773,56 @@ void init_pose_cbk(const geometry_msgs::msg::PoseWithCovarianceStamped::ConstPtr
     state_point.vel.setZero();
     kf.change_x(state_point);
     path.poses.clear();
+
+    // /initialpose 수신 시점에 새 pose 중심으로 크롭 트리를 통째로 재구성.
+    // 드물게 발생하는 사용자 개입이므로 Build()의 블로킹 비용은 허용 가능.
+    if (!laserCloudMap->points.empty())
+    {
+        // 진행 중인 크롭 백그라운드 워커(performCropUpdate)가 있다면 완료를 기다린 뒤
+        // 재구성한다 (ikdtree/laserCloudMapCropped를 동시에 건드리면 안 되므로).
+        if (crop_worker_thread.joinable())
+            crop_worker_thread.join();
+
+        const double half_range = map_crop_xy_range * 0.5;
+        const double cx = pos_lid(0);
+        const double cy = pos_lid(1);
+
+        PointCloudXYZI::Ptr temp_cropped(new PointCloudXYZI());
+        pcl::PassThrough<PointType> passX;
+        passX.setInputCloud(laserCloudMap);
+        passX.setFilterFieldName("x");
+        passX.setFilterLimits(cx - half_range, cx + half_range);
+        passX.filter(*temp_cropped);
+
+        pcl::PassThrough<PointType> passY;
+        passY.setInputCloud(temp_cropped);
+        passY.setFilterFieldName("y");
+        passY.setFilterLimits(cy - half_range, cy + half_range);
+        passY.filter(*temp_cropped);
+
+        {
+            std::lock_guard<std::mutex> lk(ikdtree_write_mutex);
+            ikdtree.set_downsample_param(filter_size_map_min);
+            ikdtree.Build(temp_cropped->points);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(cropped_map_mutex);
+            laserCloudMapCropped->points = temp_cropped->points;
+            laserCloudMapCropped->width  = laserCloudMapCropped->points.size();
+            laserCloudMapCropped->height = 1;
+
+            croppedMapVoxelOccupancy.clear();
+            for (const auto &p : laserCloudMapCropped->points)
+                croppedMapVoxelOccupancy.insert(voxelKey2D(p.x, p.y, filter_size_map_min));
+        }
+
+        prev_kf_pos = pos_lid;
+        kf_flag = true;
+        // 백그라운드 워커가 마침 이 시점에 막 끝나서 just_finished가 서 있을 수 있으므로
+        // 이번 리셋과 무관한 이전 사이클의 퍼블리시가 뒤늦게 발생하지 않도록 정리.
+        crop_update_just_finished = false;
+    }
 
     initial_flag = false;
     cout<<"Initial pose is Received."<<endl;
@@ -770,8 +1070,12 @@ void map_incremental()
     }
 
     double st_time = omp_get_wtime();
-    add_point_size = ikdtree.Add_Points(PointToAdd, true);
-    ikdtree.Add_Points(PointNoNeedDownsample, false); 
+    {
+        // 크롭-diff 백그라운드 워커와 ikdtree 쓰기(Add/Delete)가 겹치지 않도록 직렬화.
+        std::lock_guard<std::mutex> lk(ikdtree_write_mutex);
+        add_point_size = ikdtree.Add_Points(PointToAdd, true);
+        ikdtree.Add_Points(PointNoNeedDownsample, false);
+    }
     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     kdtree_incremental_time = omp_get_wtime() - st_time;
     
@@ -915,7 +1219,9 @@ void PublishKeyFrame(rclcpp::Publisher<fast_lio::msg::Frame>::SharedPtr pubKeyFr
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*laserCloudMap, laserCloudmsg);
+    // 크롭 워커(백그라운드 스레드)가 동시에 laserCloudMapCropped를 갱신할 수 있으므로 보호.
+    std::lock_guard<std::mutex> lk(cropped_map_mutex);
+    pcl::toROSMsg(*laserCloudMapCropped, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
     laserCloudmsg.header.frame_id = "odom";
     pubLaserCloudMap->publish(laserCloudmsg);
@@ -1051,7 +1357,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         matching_dop = computeDOP(dop_cloud, Eigen::Vector3d(0,0,0));
 
         lidar_meas_cov = matching_dop * LASER_POINT_COV;
-        dop_ratio = scan_dop/matching_dop;
+        dop_ratio = down_dop/matching_dop;
     }
 
     if (effct_feat_num < 1)
@@ -1182,7 +1488,9 @@ public:
         qos_viz.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
         qos_viz.durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
 
-        auto qos_latched = rclcpp::QoS(rclcpp::KeepLast(5)).transient_local().reliable();
+        auto qos_loc = rclcpp::QoS(rclcpp::KeepLast(10));
+        qos_loc.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+        qos_loc.durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
 
         path_en = this->declare_parameter("publish.path_en", true);
         scan_pub_en = this->declare_parameter("publish.scan_publish_en", true);
@@ -1197,6 +1505,7 @@ public:
         time_diff_lidar_to_imu = this->declare_parameter("common.time_offset_lidar_to_imu", 0.0);
         filter_size_surf_min = this->declare_parameter("filter_size_surf", 0.5);
         filter_size_map_min = this->declare_parameter("filter_size_map", 0.5);
+        map_crop_xy_range = this->declare_parameter("localization.map_crop_xy_range", 50.0);
         cube_len = this->declare_parameter("cube_side_length", 200.);
         DET_RANGE = this->declare_parameter("localization.det_range", 300.);
         fov_deg = this->declare_parameter("localization.fov_degree", 180.);
@@ -1216,8 +1525,6 @@ public:
         extrinsic_est_en = this->declare_parameter("localization.extrinsic_est_en", true);
         extrinT = this->declare_parameter("localization.extrinsic_T", vector<double>());
         extrinR = this->declare_parameter("localization.extrinsic_R", vector<double>());
-        extrin_g2o_T = this->declare_parameter("localization.extrinsic_g2o_T", vector<double>());
-        extrin_g2o_R = this->declare_parameter("localization.extrinsic_g2o_R", vector<double>());
         odom_mode = this->declare_parameter("localization.odom_mode", 0);
         v_fov = this->declare_parameter("localization.fov_u", 15.0);
 
@@ -1236,12 +1543,8 @@ public:
         
         lidar_meas_cov = LASER_POINT_COV;
 
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
         downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
         downSizeFilterMap.setLeafSize(filter_size_map_min, filter_size_map_min, filter_size_map_min);
-        memset(point_selected_surf, true, sizeof(point_selected_surf));
-        memset(res_last, -1000.0f, sizeof(res_last));
 
         filter_size_surf_ad = filter_size_surf_min;
         point_filter_num_ad = point_filter_num;
@@ -1267,29 +1570,25 @@ public:
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, qos_viz, livox_pcl_cbk);
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, qos_loc, livox_pcl_cbk);
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, qos_viz, standard_pcl_cbk);
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, qos_loc, standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos_viz, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, qos_loc, imu_cbk);
         sub_initPose = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", qos_viz, init_pose_cbk);
-        sub_odom = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, qos_viz,
-            [this](const nav_msgs::msg::Odometry::ConstPtr &odom) {
-                odom_callback(odom);
-                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-            });
+        sub_odom = this->create_subscription<nav_msgs::msg::Odometry>(odom_topic, qos_loc, odom_callback);
         
-        sub_tf_static_ = this->create_subscription<tf2_msgs::msg::TFMessage>("/tf_static", qos_latched, tf_static_cbk);
-        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", qos_viz);
+        sub_tf_static_ = this->create_subscription<tf2_msgs::msg::TFMessage>("/tf_static", qos_viz, tf_static_cbk);
+        pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", qos_loc);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", qos_viz);
-        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", qos_viz);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", qos_latched);
+        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", qos_loc);
+        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", qos_viz);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", qos_viz);
-        pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", qos_viz);
+        pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", qos_loc);
         pubKeyFrame = this->create_publisher<fast_lio::msg::Frame> ("/key_frame", qos_viz);
-        pub_analytics_ = this->create_publisher<fast_lio::msg::LocAnalytics>("/loc_analytics", qos_viz);
+        pub_analytics_ = this->create_publisher<fast_lio::msg::LocAnalytics>("/loc_analytics", qos_loc);
         analytics_num_proc_ = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (analytics_num_proc_ <= 0) analytics_num_proc_ = 1;
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -1298,8 +1597,6 @@ public:
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(20.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserLocalizationNode::timer_callback, this));
 
-        publish_map(pubLaserCloudMap_);
-
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -1307,6 +1604,7 @@ public:
     {}
 
 private:
+
     void timer_callback()
     {
         analytics_pre_lidar_buf_ = (int64_t)lidar_buffer.size();
@@ -1327,11 +1625,22 @@ private:
 
             match_time = 0;
 
+            PointCloudXYZI::Ptr temp_feats_undistort(new PointCloudXYZI());
             double t_imu_start = omp_get_wtime();
-            p_imu->Process(Measures, kf, feats_undistort);
+            p_imu->Process(Measures, kf, temp_feats_undistort);
             analytics_imu_time_ = omp_get_wtime() - t_imu_start;
             state_point = kf.get_x();
-            
+
+            feats_undistort->points.clear();
+            feats_undistort->points.reserve(temp_feats_undistort->points.size());
+            const double det_range_sq = static_cast<double>(DET_RANGE) * DET_RANGE;
+            for (const auto &p : temp_feats_undistort->points)
+            {
+                const double range_sq = p.x * p.x + p.y * p.y + p.z * p.z;
+                if (range_sq <= det_range_sq)
+                    feats_undistort->points.push_back(p);
+            }
+
             /*** Transform feats_undistort from LiDAR frame to body frame ***/
             Eigen::Affine3f body_TF = Eigen::Affine3f::Identity();
             body_TF.linear() = Odom_R_wrt_LIDAR.cast<float>();
@@ -1349,7 +1658,7 @@ private:
                             false : true;
 
             /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            // lasermap_fov_segment();
 
             if (dop_flag)
             {
@@ -1432,8 +1741,35 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            /******* Publish key frame *******/
+            // 크롭-diff 맵 갱신(ikdtree Add/Delete, 최초 Build 등)은 20ms 주기의 timer_callback을
+            // 블로킹하지 않도록 별도 백그라운드 스레드(performCropUpdate)에서 실행한다.
+            // 이미 백그라운드 작업이 진행 중이면 이번 사이클은 트리거를 건너뛰고(prev_kf_pos는
+            // 작업 완료 시점에 갱신되므로 kf_dist는 계속 커진 채로 다음 스캔에서 재평가된다),
+            // 작업이 없으면 새로 스폰한다.
+            double kf_dist = (pos_lid - prev_kf_pos).norm();
+            if ((kf_dist > kf_thres_ || !kf_flag) && !crop_update_in_progress.load())
+            {
+                const bool is_first = !kf_flag;
+                const vect3 kf_pos_snapshot = pos_lid;
+
+                crop_update_in_progress = true;
+                if (crop_worker_thread.joinable())
+                    crop_worker_thread.join();  // 직전 작업은 이미 끝난 상태(in_progress==false)였으므로 즉시 반환
+                crop_worker_thread = std::thread(performCropUpdate, kf_pos_snapshot, is_first);
+            }
+
+            // 백그라운드 크롭 작업이 방금 끝났다면, 메인 스레드에서 현재 스캔 상태(feats_undistort 등)로
+            // 맵/키프레임을 퍼블리시한다 (PublishKeyFrame이 참조하는 전역 상태가 스캔마다 갱신되므로
+            // 백그라운드 스레드가 아닌 여기서 호출해야 데이터 정합성이 보장됨).
+            if (crop_update_just_finished.exchange(false))
+            {
+                publish_map(pubLaserCloudMap_);
+                PublishKeyFrame(pubKeyFrame);
+            }
+
             /******* Publish odometry *******/
-            if (odom_mode == 0) publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             analytics_map_time_    = 0.0;
@@ -1452,11 +1788,20 @@ private:
                     /* transform to world frame */
                     RGBpointLidarToWorld(&(feats_undistort->points[k]), &(temp_worldMap->points[k]));                    
                 }
-                *laserCloudMap += *temp_worldMap;                
-                downSizeFilterMap.setInputCloud(laserCloudMap);
-                downSizeFilterMap.filter(*laserCloudMap);
+                // laserCloudMap(pristine 마스터 맵)은 더 이상 온라인 갱신으로 변형하지 않음.
+                // 온라인 스캔은 크롭 창의 라이브 상태인 laserCloudMapCropped에만 병합한다.
+                // 크롭-diff 백그라운드 워커도 동일 변수를 건드리므로 mutex로 보호.
+                {
+                    std::lock_guard<std::mutex> lk(cropped_map_mutex);
+                    *laserCloudMapCropped += *temp_worldMap;
+                    downSizeFilterMap.setInputCloud(laserCloudMapCropped);
+                    downSizeFilterMap.filter(*laserCloudMapCropped);
+
+                    // 방금 병합된 점들을 점유 해시셋에 반영 (다음 키프레임에서 중복 add 방지)
+                    for (const auto &p : temp_worldMap->points)
+                        croppedMapVoxelOccupancy.insert(voxelKey2D(p.x, p.y, filter_size_map_min));
+                }
                 cout<<"map updated."<<endl;
-                publish_map(pubLaserCloudMap_);
             }
             
             /******* Publish points *******/
@@ -1465,14 +1810,6 @@ private:
             if (initial_flag)   publish_frame_body(pubLaserCloudFull_body_);
             publish_effect_world(pubLaserCloudEffect_);
 
-            /******* Publish key frame *******/
-            double kf_dist = (pos_lid - prev_kf_pos).norm();
-            if (kf_dist > kf_thres_ || !kf_flag)
-            {
-                PublishKeyFrame(pubKeyFrame);
-                prev_kf_pos = pos_lid;
-                kf_flag = true;
-            }   
 
             double current_process_time = omp_get_wtime() - process_start;
             total_process_time += current_process_time;
@@ -1482,7 +1819,8 @@ private:
             if (analytics_start_time_ < 0.0)
                 analytics_start_time_ = omp_get_wtime();
 
-            analytics_total_time_ = analytics_imu_time_ + analytics_state_time_ + analytics_map_time_;
+            analytics_total_time_ = current_process_time;
+            // analytics_total_time_ = analytics_imu_time_ + analytics_state_time_ + analytics_map_time_;
 
             // Cumulative timing (Welford online mean)
             analytics_frame_cnt_++;
@@ -1596,10 +1934,6 @@ private:
         msg.acc_bias_norm = state_point.ba.norm();
         msg.gyr_bias_norm = state_point.bg.norm();
 
-        // --- Time sync offsets ---
-        msg.lid_offset = time_diff_lidar_to_imu;
-        msg.imu_offset = timediff_lidar_wrt_imu;
-
         // --- Per-frame processing time ---
         msg.imu_time   = analytics_imu_time_;
         msg.state_time = analytics_state_time_;
@@ -1673,6 +2007,11 @@ int main(int argc, char** argv)
     signal(SIGINT, SigHandle);
 
     rclcpp::spin(std::make_shared<LaserLocalizationNode>());
+
+    // 종료 시 크롭-diff 백그라운드 워커가 아직 돌고 있으면 join 없이 프로그램이 끝나면서
+    // std::thread 소멸자가 terminate()를 유발할 수 있으므로 안전하게 정리한다.
+    if (crop_worker_thread.joinable())
+        crop_worker_thread.join();
 
     if (rclcpp::ok())
         rclcpp::shutdown();
