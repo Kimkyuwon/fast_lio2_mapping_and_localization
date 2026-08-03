@@ -17,6 +17,7 @@ A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution 
 
 </div>
 
+
 ---
 
 ## Key Features
@@ -37,6 +38,7 @@ A LiDAR-Inertial SLAM package based on FAST-LIO2, integrating a **DOP (Dilution 
 
 ## Algorithm Overview
 
+
 ### FAST-LIO2 Core Pipeline
 
 FAST-LIO2 estimates robot pose using an Iterated Error State Kalman Filter (IESKF) that tightly couples IMU data with LiDAR point clouds.
@@ -45,6 +47,7 @@ FAST-LIO2 estimates robot pose using an Iterated Error State Kalman Filter (IESK
 2. **LiDAR Motion Undistortion**: Corrects scan distortion using IMU integration results
 3. **Point Matching**: Scan-to-map point matching using ikd-Tree
 4. **IESKF Update**: Updates state and covariance using matching residuals as observations
+
 
 ### DOP-Based Scan Matching Confidence Evaluation
 
@@ -99,12 +102,14 @@ the two adaptive parameters become:
 
 **DOP Usage Summary**
 
-| Metric | Input point set | Usage |
-|--------|-----------------|-------|
-| `scan_dop` | Undistorted full scan (`feats_undistort`) | Adaptive voxel leaf size and point stride |
-| `down_dop` | Downsampled scan (`feats_down_body`) | Reference for `dop_ratio` (Localization only) |
-| `matching_dop` | Points actually matched in the IESKF update | Measurement covariance scaling (`lidar_meas_cov`) |
-| `dop_ratio` | `down_dop / matching_dop` | Initialization / map augmentation trigger (Localization only) |
+
+| Metric         | Input point set                             | Usage                                                         |
+| -------------- | ------------------------------------------- | ------------------------------------------------------------- |
+| `scan_dop`     | Undistorted full scan (`feats_undistort`)   | Adaptive voxel leaf size and point stride                     |
+| `down_dop`     | Downsampled scan (`feats_down_body`)        | Reference for `dop_ratio` (Localization only)                 |
+| `matching_dop` | Points actually matched in the IESKF update | Measurement covariance scaling (`lidar_meas_cov`)             |
+| `dop_ratio`    | `down_dop / matching_dop`                   | Initialization / map augmentation trigger (Localization only) |
+
 
 ![DOP](doc/dop.png)
 
@@ -112,19 +117,23 @@ the two adaptive parameters become:
 
 `dop_ratio` expresses how much of the observable scan geometry was actually explained by the prior map. It drives two decisions in Localization mode:
 
-| Condition | Behavior |
-|-----------|----------|
-| `dop_ratio >= 0.8` while not yet initialized | Localization is declared initialized (`Position is Initialized.`); before that the EKF update is rejected and velocity is zeroed |
-| `dop_ratio < 0.6` after initialization | The current scan is merged into the live local map (`map_incremental` + merge into the cropped map), covering regions missing from the prior map |
+
+| Condition                                    | Behavior                                                                                                                                         |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dop_ratio >= 0.8` while not yet initialized | Localization is declared initialized (`Position is Initialized.`); before that the EKF update is rejected and velocity is zeroed                 |
+| `dop_ratio < 0.6` after initialization       | The current scan is merged into the live local map (`map_incremental` + merge into the cropped map), covering regions missing from the prior map |
+
 
 ---
 
 ## Map Management
 
+
 ### Mapping Mode — ikd-Tree Sliding Window + Point Cap
 
 - A local map cube of side `cube_side_length` follows the robot. When the sensor comes within `1.5 × det_range` of a cube face, the cube is shifted and the out-of-range boxes are removed with `Delete_Point_Boxes`.
 - Independently, `trim_map_by_count()` checks `ikdtree.validnum()` every frame. Once it exceeds `mapping.max_map_points` (default 200,000), the oldest points — ordered by their insertion timestamp stored in the `curvature` field — are deleted down to 95% of the cap.
+
 
 ### Localization Mode — Crop-Based Local Map
 
@@ -136,43 +145,15 @@ the two adaptive parameters become:
 
 ---
 
+
+
 ## ROS 2 Interfaces
 
 ### Mapping Node (`fastlio_mapping`)
 
-| Direction | Topic | Type |
-|-----------|-------|------|
-| Sub | `common.lid_topic` | `sensor_msgs/PointCloud2` or `livox_ros_driver2/CustomMsg` (Livox) |
-| Sub | `common.imu_topic` | `sensor_msgs/Imu` |
-| Pub | `/Odometry` | `nav_msgs/Odometry` |
-| Pub | `/path` | `nav_msgs/Path` |
-| Pub | `/cloud_registered` | `sensor_msgs/PointCloud2` (world frame) |
-| Pub | `/cloud_registered_body` | `sensor_msgs/PointCloud2` (body frame) |
-| Pub | `/cloud_effected` | `sensor_msgs/PointCloud2` (matched features) |
-| Pub | `/key_frame` | `fast_lio/Frame` → `pose_graph_optimization` |
-| Pub | `/lio_analytics` | `fast_lio/LioAnalytics` |
-| TF | `odom` → `base_link` | — |
-
 The main loop runs on a 10 ms timer. A keyframe is emitted whenever the traveled distance since the last keyframe exceeds `mapping.keyframe_threshold`.
 
 ### Localization Node (`fastlio_localization`)
-
-| Direction | Topic | Type |
-|-----------|-------|------|
-| Sub | `common.lid_topic` | `sensor_msgs/PointCloud2` or `livox_ros_driver2/CustomMsg` (Livox) |
-| Sub | `common.imu_topic` | `sensor_msgs/Imu` |
-| Sub | `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` (RViz *2D Pose Estimate*) |
-| Sub | `common.odom_topic` | `nav_msgs/Odometry` (wheel odometry) |
-| Sub | `/tf_static` | `tf2_msgs/TFMessage` |
-| Pub | `/Odometry` | `nav_msgs/Odometry` |
-| Pub | `/path` | `nav_msgs/Path` |
-| Pub | `/cloud_registered` | `sensor_msgs/PointCloud2` (world frame) |
-| Pub | `/cloud_registered_body` | `sensor_msgs/PointCloud2` (body frame, published only after initialization) |
-| Pub | `/cloud_effected` | `sensor_msgs/PointCloud2` (matched features) |
-| Pub | `/Laser_map` | `sensor_msgs/PointCloud2` (current cropped local map) |
-| Pub | `/key_frame` | `fast_lio/Frame` |
-| Pub | `/loc_analytics` | `fast_lio/LocAnalytics` |
-| TF | `odom` → `base_link` | — |
 
 The main loop runs on a 20 ms timer. The initial pose is set by publishing to `/initialpose`; no ICP/NDT pre-alignment is performed — the pose is written straight into the EKF state and the local map is rebuilt around it. **The robot must be stationary**: the request is rejected (`Cannot init Position.`) if the wheel odometry reports linear velocity above 0.01 m/s or angular velocity above 0.5°/s.
 
@@ -193,11 +174,14 @@ The main loop runs on a 20 ms timer. The initial pose is set by publishing to `/
 
 ## Prerequisites
 
+
+
 ### 1. Ubuntu & ROS2
 
 - **Ubuntu >= 20.04** (Recommended: Ubuntu 22.04)
 - **ROS >= Foxy** (Recommended: ROS Humble)
   - [ROS Humble Installation](https://docs.ros.org/en/humble/Installation.html)
+
 
 ### 2. PCL & Eigen
 
@@ -207,6 +191,7 @@ sudo apt install libpcl-dev libeigen3-dev
 
 - PCL >= 1.8
 - Eigen >= 3.3.4
+
 
 ### 3. livox_ros_driver2
 
@@ -224,6 +209,7 @@ Add to `~/.bashrc`:
 source ~/ws_livox/install/setup.bash
 ```
 
+
 ### 4. Dependencies (Mapping Mode)
 
 `mapping.launch.py` launches the `pose_graph_optimization` node, so the package must be present in the same workspace:
@@ -232,6 +218,8 @@ source ~/ws_livox/install/setup.bash
 cd <ros2_ws>/src
 git clone https://github.com/Kimkyuwon/Pose_Graph_Optimization.git
 ```
+
+
 
 ### 5. Optional — octomap_server (Localization Mode)
 
@@ -242,6 +230,7 @@ sudo apt install ros-humble-octomap-server
 ```
 
 ---
+
 
 ## Build
 
@@ -258,7 +247,10 @@ source install/setup.bash
 
 ---
 
+
+
 ## Usage
+
 
 ### Mapping Mode
 
@@ -272,72 +264,17 @@ Launches `fastlio_mapping` together with `pose_graph_optimization`. The RViz nod
 ros2 run rviz2 rviz2 -d $(ros2 pkg prefix fast_lio)/share/fast_lio/rviz/fastlio.rviz
 ```
 
-Change `config_file` according to your LiDAR:
-
-| LiDAR | Config File | `lidar_type` |
-|-------|-------------|--------------|
-| Ouster 32 (default) | `mapping_config.yaml` | 3 |
-| Ouster 64 | `ouster64.yaml` | 3 |
-| Ouster 128 | `ouster128.yaml` | 3 |
-| Velodyne 16 | `velodyne.yaml` | 2 |
-| Hesai Pandar 32 | `hesai32.yaml` | 4 |
-| Livox Avia | `avia.yaml` | 1 |
-| Livox MID360 | `mid360.yaml` | 1 |
-| Livox MID70 | `mid70.yaml` | 1 |
-
-> `config/ouster32.yaml` is a legacy file kept for reference; it lacks the `/**: ros__parameters:` wrapper and will not load under ROS 2. Use `mapping_config.yaml` instead.
-
-**Launch the LiDAR driver separately when using real hardware**:
-
-```bash
-# MID360 example
-ros2 launch livox_ros_driver2 msg_MID360_launch.py
-```
-
 ### Localization Mode
 
 ```bash
 ros2 launch fast_lio localization.launch.py config_file:=localization_config.yaml
 ```
 
-Localization config files, one per sensor, differ from the mapping ones mainly in `map_file_path` and the `localization:` block:
-
-| Config File | `lidar_type` | Bundled `map_file_path` |
-|-------------|--------------|-------------------------|
-| `localization_config.yaml` (default) | 3 (Ouster 32) | `Map/b2.pcd` |
-| `ouster32_localization.yaml` | 3 (Ouster 32) | `Map/map1.pcd` |
-| `velodyne_localization.yaml` | 2 (Velodyne 16) | `Map/gsic_map.pcd` |
-| `hesai32_localization.yaml` | 3 (Hilti / Hesai 32 via the Ouster handler) | `Map/hilti.pcd` |
-| `mid360_localization.yaml` | 1 (Livox MID360) | `Map/g1Map.pcd` |
-
 Steps:
 
-1. Set `map_file_path` to the pre-built `.pcd` map. The path is resolved against `ROOT_DIR`, i.e. the package source directory, e.g. `"Map/b2.pcd"`.
+1. Set `map_file_path` to the pre-built `.pcd` map. The path is resolved against `ROOT_DIR`, i.e. the package source directory.
 2. Launch the node, then publish an initial pose with RViz **2D Pose Estimate** (`/initialpose`) while the robot is stationary.
 3. Drive slowly until `Position is Initialized.` appears — this happens once `dop_ratio` reaches 0.8.
-
-### Key Parameters
-
-| Parameter | Mode | Default | Description |
-|-----------|------|---------|-------------|
-| `filter_size_surf` | both | 0.5 | Base voxel leaf size for scan downsampling (scaled by scan DOP) |
-| `filter_size_map` | both | 0.5 | ikd-Tree / map voxel resolution |
-| `point_filter_num` | both | 2 | Base point stride (scaled by scan DOP) |
-| `max_iteration` | both | 4 | Maximum IESKF iterations per frame |
-| `cube_side_length` | both | 200.0 | ikd-Tree local map cube side length (m) |
-| `mapping.det_range` | mapping | 300.0 | LiDAR effective detection range (m) |
-| `mapping.max_map_points` | mapping | 200000 | Hard cap on map points; oldest points are trimmed above this |
-| `mapping.keyframe_threshold` | mapping | 0.5 | Travel distance between keyframes (m) |
-| `mapping.dop_flag` | mapping | false | Enable DOP-based adaptive filtering and covariance scaling |
-| `posegraph.fov_u` | mapping | 15.0 | Vertical FOV (deg) used for DOP normalization |
-| `map_file_path` | localization | `""` | Prior `.pcd` map path, relative to the package source directory |
-| `localization.map_crop_xy_range` | localization | 50.0 | Width of the X-Y local map crop window (m) |
-| `localization.det_range` | localization | 300.0 | LiDAR effective detection range (m) |
-| `localization.keyframe_threshold` | localization | 0.5 | Travel distance that triggers a crop window update (m) |
-| `localization.dop_flag` | localization | false | Enable DOP-based adaptive filtering, initialization, and map augmentation |
-| `localization.fov_u` | localization | 15.0 | Vertical FOV (deg) used for DOP normalization |
-| `common.odom_topic` | localization | `/scout_base_controller/odom` | Wheel odometry topic used to gate `/initialpose` |
-| `mapping/localization.extrinsic_T`, `extrinsic_R` | both | identity | LiDAR-to-IMU extrinsics |
 
 ---
 
@@ -347,23 +284,29 @@ The DOP-based scan matching confidence evaluation was validated on the following
 
 ### Hilti SLAM Challenge 2022 (ATE, m)
 
-| Method | exp-06 RMSE | exp-14 RMSE | exp-16 RMSE | exp-18 RMSE |
-|--------|------------|------------|------------|------------|
-| FAST-LIO2 | 0.039 | 0.058 | div. | 1.452 |
-| Faster-LIO | 0.070 | 0.090 | div. | 4.000 |
-| **Proposed** | **0.045** | 0.077 | **0.636** | **0.156** |
+
+| Method       | exp-06 RMSE | exp-14 RMSE | exp-16 RMSE | exp-18 RMSE |
+| ------------ | ----------- | ----------- | ----------- | ----------- |
+| FAST-LIO2    | 0.039       | 0.058       | div.        | 1.452       |
+| Faster-LIO   | 0.070       | 0.090       | div.        | 4.000       |
+| **Proposed** | **0.045**   | 0.077       | **0.636**   | **0.156**   |
+
 
 > exp-16 and exp-18 include narrow staircase segments where existing methods diverge. The proposed DOP method maintains stable estimation throughout.
 
+
 ### VBR SLAM Dataset (ATE, m)
 
-| Method | Colosseum RMSE | Diag RMSE |
-|--------|---------------|----------|
-| Faster-LIO | 2.730 | 0.217 |
-| Faster-LIO + PGO | 0.386 | 0.179 |
-| **Proposed (DOP + PGO)** | **0.250** | **0.165** |
+
+| Method                   | Colosseum RMSE | Diag RMSE |
+| ------------------------ | -------------- | --------- |
+| Faster-LIO               | 2.730          | 0.217     |
+| Faster-LIO + PGO         | 0.386          | 0.179     |
+| **Proposed (DOP + PGO)** | **0.250**      | **0.165** |
+
 
 ---
+
 
 ## Related Papers
 
@@ -394,6 +337,8 @@ The DOP-based scan matching confidence evaluation was validated on the following
 
 ---
 
+
+
 ## Related Projects
 
 - [Pose-Graph-Optimization](https://github.com/Kimkyuwon/Pose_Graph_Optimization): LiDAR-based pose graph optimization backend with loop closure detection and dynamic object removal
@@ -401,6 +346,8 @@ The DOP-based scan matching confidence evaluation was validated on the following
 - [SLAM-WebGUI](https://github.com/Kimkyuwon/ROS-SLAM-WebUI): Web-based GUI integrating SLAM, localization, and real-time visualization into a single browser interface — consumes `/lio_analytics` and `/loc_analytics` for live monitoring
 
 ---
+
+
 
 ## Acknowledgments
 
