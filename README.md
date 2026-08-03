@@ -88,9 +88,14 @@ When `dop_flag` is `false`, the covariance stays fixed at $\sigma_L^2$.
 
 **Step 4 — Adaptive Downsampling**
 
-The scan DOP scales both the voxel leaf size and the pre-scan point stride, so that poor geometry keeps more points:
+The scan DOP scales both the voxel leaf size and the pre-scan point stride, so that poor geometry keeps more points. With the scale factor
 
-$$s = \frac{1}{\rho_{\text{scan}}}, \quad \text{leaf} = \text{clamp}(s \cdot \text{filter\_size\_surf},\ 0.05,\ 1.0), \quad \text{stride} = \text{clamp}(s \cdot \text{point\_filter\_num},\ 1,\ \tfrac{N_{\text{scan}}}{2})$$
+$$s = \frac{1}{\rho_{\text{scan}}}$$
+
+the two adaptive parameters become:
+
+- `filter_size_surf_ad` = clamp(*s* × `filter_size_surf`, 0.05, 1.0)
+- `point_filter_num_ad` = clamp(*s* × `point_filter_num`, 1, `scan_line` / 2)
 
 **DOP Usage Summary**
 
